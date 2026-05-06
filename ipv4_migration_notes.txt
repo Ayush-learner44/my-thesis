@@ -1,0 +1,276 @@
+================================================================
+WHY WE CONSIDERED SHIFTING TO IPv4 — AND WHAT WE LEARNED
+================================================================
+
+NOTE: IPv6 ended up working after applying a sysctl fix (see bottom).
+      This document exists so you understand WHY it broke and what
+      each term means, in case you face it again or decide to migrate later.
+
+================================================================
+SECTION 1: THE PROBLEM WE HIT (IPv6 in WSL2 + Mininet)
+================================================================
+
+When we ran traffic.py from h2, we got:
+    "Error: IPv6 is disabled on this device."
+
+And ping6 failed with:
+    "Cannot assign requested address"
+
+Root cause:
+    WSL2 (Windows Subsystem for Linux) sets a kernel-level flag that
+    DISABLES IPv6 on newly created network interfaces by default.
+
+    The flag is:
+        net.ipv6.conf.default.disable_ipv6 = 1
+
+    When Mininet creates virtual interfaces (veth pairs) for each host,
+    those interfaces inherit this "disabled" flag from the WSL2 default.
+    Result: h2's interface had IPv6 disabled. h1, h3 happened to be
+    fine due to order/timing quirks in namespace creation.
+
+    The fix we applied (added to each script):
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0
+        sysctl -w net.ipv6.conf.default.disable_ipv6=0
+
+    This re-enables IPv6 in the current host's network namespace
+    before doing anything else.
+
+================================================================
+SECTION 2: WHY IPv4 WOULD HAVE BEEN EASIER (reference)
+================================================================
+
+These are the specific pain points IPv6 caused that IPv4 avoids:
+
+PAIN POINT 1 — NDP instead of ARP
+    IPv6 uses NDP (Neighbor Discovery Protocol) to resolve IPs → MACs.
+    NDP uses MULTICAST packets. Our P4 switch has no multicast forwarding
+    rule, so NDP packets get DROPPED. This means hosts cannot discover
+    each other's MACs automatically. We had to manually install static
+    neighbor entries in every script.
+
+    IPv4 uses ARP, which p4-utils handles automatically with net.l2().
+    Zero manual work needed.
+
+PAIN POINT 2 — DAD (Duplicate Address Detection)
+    Every time an IPv6 address is assigned to an interface, the Linux
+    kernel runs DAD. During DAD (~1 second), the address is in TENTATIVE
+    state and CANNOT be used as a source address for outgoing connections.
+    This caused our first connections to fail silently.
+
+    We fixed this with the "nodad" flag:
+        ip -6 addr add nodad 2001:1:1::2/64 dev h2-eth0
+
+    IPv4 has no DAD. Addresses work instantly after assignment.
+
+PAIN POINT 3 — WSL2 disables IPv6 per-interface
+    Explained in Section 1. IPv4 is never disabled by WSL2.
+
+PAIN POINT 4 — More code in every script
+    Because of NDP, every script (server.py, traffic.py, attack.py)
+    needed manual neighbor entry setup code. With IPv4 + net.l2(),
+    all of that code is deleted — the framework handles it.
+
+PAIN POINT 5 — 128-bit addresses in P4 and controller
+    IPv6 addresses are bit<128> in P4. IPv4 would be bit<32>.
+    Smaller addresses = simpler digest parsing in controller.py.
+
+================================================================
+SECTION 3: GLOSSARY OF HARD TERMS
+================================================================
+
+--- ARP (Address Resolution Protocol) ---
+    The IPv4 mechanism for answering the question:
+    "I know the IP address I want to talk to — but what is its MAC address?"
+
+    How it works:
+        Host A broadcasts: "Who has IP 10.0.0.2? Tell me your MAC."
+        Host B replies directly: "10.0.0.2 is at MAC aa:00:00:00:00:02"
+        Host A caches this and uses that MAC in future packets.
+
+    In p4-utils with net.l2():
+        The framework pre-populates these ARP entries on ALL hosts at
+        startup as PERMANENT entries (they never expire, never broadcast).
+        So ARP traffic never goes through the P4 switch at all.
+
+--- NDP (Neighbor Discovery Protocol) ---
+    The IPv6 equivalent of ARP. But more complex:
+        - Uses ICMPv6 Neighbor Solicitation (NS) and Neighbor Advertisement (NA)
+        - Uses MULTICAST addresses (not broadcast)
+        - Also handles router discovery, prefix announcements, DAD
+
+    The multicast problem:
+        When h2 needs h0's MAC, it sends a Neighbor Solicitation to the
+        multicast address ff02::1:ff00:10 (not to all hosts, to a specific
+        multicast group). Our P4 l2_forward table has no entry for that
+        multicast MAC → P4 drops the packet → NDP fails → h2 can never
+        learn h0's MAC automatically → all connections fail.
+
+    Our fix:
+        Manually install static neighbor entries in each script:
+            ip -6 neigh replace 2001:1:1::10 lladdr aa:00:00:00:00:00
+                                dev h2-eth0 nud permanent
+        This tells the kernel "don't do NDP, just USE this MAC directly."
+
+--- DAD (Duplicate Address Detection) ---
+    Before an IPv6 address becomes usable, the kernel checks that no other
+    device on the network is already using it.
+
+    Process:
+        1. Address assigned → state = TENTATIVE
+        2. Kernel sends a Neighbor Solicitation to the address's
+           solicited-node multicast group: "Is anyone using 2001:1:1::2?"
+        3. Waits ~1 second for a response
+        4. If no response → address state = PREFERRED (usable)
+        5. If a response comes → CONFLICT, address is abandoned
+
+    The problem in our setup:
+        During the TENTATIVE state, the OS refuses to use the address
+        as a source for outgoing connections. The first connection(s)
+        fail because the address isn't ready yet.
+        Also, the DAD Neighbor Solicitation packet is multicast →
+        P4 drops it → DAD never gets a collision response → technically
+        still works (goes to PREFERRED after timeout), but the timing
+        causes failures.
+
+    Our fix:
+        ip -6 addr add nodad 2001:1:1::2/64 dev h2-eth0
+        The "nodad" flag skips the DAD process entirely.
+        Address goes directly to PREFERRED state. Usable immediately.
+
+--- veth (Virtual Ethernet pair) ---
+    A pair of linked virtual network interfaces. Whatever goes in one
+    end comes out the other. Mininet uses these to connect hosts and
+    switches: one end lives in the host's network namespace, the other
+    end lives in the switch's namespace. They act like a virtual cable.
+
+--- Network Namespace ---
+    A Linux kernel feature that gives a process its own isolated copy
+    of the network stack: its own interfaces, routing table, ARP table,
+    firewall rules, etc. Mininet uses one namespace per host (h0, h1, h2...)
+    so each host is completely isolated from the others at the OS level,
+    even though they all run on the same physical machine.
+
+--- sysctl ---
+    A Linux command/interface for reading and writing kernel parameters
+    at runtime without rebooting.
+
+    Example:
+        sysctl -w net.ipv6.conf.all.disable_ipv6=0
+        This writes the value 0 to the kernel parameter that controls
+        whether IPv6 is disabled on all interfaces.
+
+    Parameters under net.ipv6.conf.all affect all interfaces.
+    Parameters under net.ipv6.conf.default affect newly created interfaces.
+    Parameters under net.ipv6.conf.IFNAME affect a specific interface.
+
+--- CMS (Count-Min Sketch) ---
+    A probabilistic data structure that estimates how many times something
+    has been seen, using very little memory.
+
+    Our implementation:
+        2 rows × 1024 columns of 32-bit counters.
+        For each incoming SYN packet, we compute two hash functions on the
+        5-tuple (src_ip, dst_ip, src_port, dst_port, protocol):
+            hash1 (CRC16) → column index in row 0
+            hash2 (CRC32) → column index in row 1
+        Increment both cells. The minimum of the two cells is the estimate
+        of how many SYNs this flow has sent.
+
+    Why min?
+        Hash collisions can only INCREASE a counter (another flow hashes
+        to the same cell). The minimum across rows is the most conservative
+        (least overcounted) estimate.
+
+    Why 2 rows?
+        Reduces collision probability. With 1024 columns:
+        probability that two flows share BOTH cells ≈ (1/1024)² ≈ 0.0001%
+
+--- Digest (P4Runtime) ---
+    A lightweight mechanism for the P4 data plane (switch) to send
+    small pieces of metadata UP to the controller, without sending
+    the full packet.
+
+    How it works:
+        In P4 code: digest<my_struct>(1, { field1, field2, ... });
+        This packages the listed fields and queues them for delivery
+        to the controller via the gRPC bidirectional stream.
+        The controller calls get_digest_list() in a loop to receive them.
+
+    Why not send the full packet?
+        Digests are tiny (just the fields you care about), fast, and
+        don't require a CPU port or raw socket handling. Perfect for
+        sending flow metadata like "new flow seen, timestamp X".
+
+--- gRPC ---
+    Google Remote Procedure Call. A framework for making function calls
+    across a network, using HTTP/2 as transport and Protocol Buffers
+    for serialization.
+
+    In our system:
+        The controller connects to the switch via a gRPC bidirectional
+        streaming channel. This single channel carries:
+            Controller → Switch: table updates, digest enable, etc.
+            Switch → Controller: digest notifications
+
+    Port: 9559 for our first switch (s1).
+
+--- Thrift ---
+    An older RPC framework (from Facebook/Apache) that BMv2 also exposes
+    for control plane access. Used for register read/write operations
+    since the p4-utils P4Runtime wrapper does NOT expose registers.
+
+    Port: 9090 for our first switch (s1).
+
+--- BMv2 (Behavioral Model v2) ---
+    A software P4 switch that runs on a normal Linux machine.
+    It is a reference implementation — NOT optimized for speed, but
+    correct and great for testing P4 programs before deploying to
+    real hardware (like Intel Tofino ASICs).
+
+    Binary: simple_switch_grpc (the gRPC-capable version we use)
+
+--- P4Runtime ---
+    The industry-standard control plane API for P4 devices. Defined by
+    the P4 Language Consortium. Works on BMv2, Tofino, and real ASICs.
+    Uses gRPC + Protocol Buffers.
+
+    In contrast to Thrift which is BMv2-only and one-directional,
+    P4Runtime is bidirectional and hardware-agnostic.
+
+--- 5-tuple ---
+    The five fields that uniquely identify a network flow:
+        src_ip, dst_ip, src_port, dst_port, protocol
+    Used as the hash key in our CMS. Two packets belong to the same
+    flow if and only if all five fields are identical.
+
+--- Egress spec ---
+    In P4 v1model, standard_metadata.egress_spec is the output port
+    number you set to tell the switch where to send the packet.
+    If you never set it (table miss with NoAction default), the packet
+    is effectively dropped because egress_spec stays at 0 or an
+    invalid value.
+
+================================================================
+SECTION 4: THE ACTUAL FIX WE USED (IPv6 stays)
+================================================================
+
+We did NOT migrate to IPv4. Instead we fixed IPv6 by adding these
+two lines at the top of attack.py, traffic.py, and server.py:
+
+    subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.disable_ipv6=0'],
+                   capture_output=True)
+    subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'],
+                   capture_output=True)
+
+And we added "nodad" to the ip addr add command in traffic.py:
+
+    ip -6 addr add nodad 2001:1:1::2/64 dev h2-eth0
+
+After these fixes:
+    - h2 and h3 successfully send legitimate TCP connections to h0
+    - h0 (server) receives and logs all connections
+    - h1 sends SYN flood attack
+    - Controller detects attack, blocks h1 via dangerous_table
+    - Legitimate hosts (h2, h3) are NOT affected — system works correctly
+
+================================================================

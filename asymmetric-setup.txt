@@ -1,0 +1,260 @@
+================================================================
+ASYMMETRIC ROUTING TOPOLOGY — QUESTIONS & SOLUTIONS
+================================================================
+
+----------------------------------------------------------------
+PROBLEM STATEMENT
+----------------------------------------------------------------
+
+In an asymmetric network:
+- Host sends SYN → travels via Path A → switch A sees it → CMS increments
+- Server sends SYN-ACK back (any path)
+- Host sends final ACK → travels via Path B → switch A NEVER sees it
+- Switch A CMS keeps incrementing with no decrement
+- Legit flash crowd gets flagged as attack → FALSE POSITIVE
+
+Goal: demonstrate this problem AND show a fix for it.
+
+----------------------------------------------------------------
+PROPOSED TOPOLOGY
+----------------------------------------------------------------
+
+```
+hosts (h1-h5)
+      |
+   merge_sw        ← splits SYN vs ACK to different paths
+   /        \
+path_a_sw   path_b_sw
+(detector)  (simple fwd)
+   \        /
+    h0 (server)
+```
+
+merge_sw logic:
+  - SYN only (SYN=1, ACK=0) → forward to path_a_sw
+  - ACK (SYN-ACK or pure ACK) → forward to path_b_sw
+
+path_a_sw: runs full CMS detection (detector.p4)
+  - sees ALL SYNs, ZERO ACKs from legit hosts
+  - CMS keeps incrementing with no decrement
+  - flash crowd falsely flagged as attack
+  - THIS IS THE PROBLEM DEMONSTRATION
+
+path_b_sw: runs SAME CMS detection code (detector.p4)
+  - sees ALL ACKs, ZERO SYNs from legit hosts
+  - CMS gets decrement signals with no increments
+  - both switches run identical P4 code
+  - difference is only in what traffic each switch sees
+
+----------------------------------------------------------------
+QUESTION 1: CAN ONE CONTROLLER PUSH DIFFERENT RULES
+            TO DIFFERENT SWITCHES?
+----------------------------------------------------------------
+
+YES. Each switch has its own API object in the controller.
+Each API object connects to one specific switch via its gRPC port.
+table_add() calls go ONLY to the switch that API object is
+connected to. No bleed between switches.
+
+Example:
+
+    api_merge  = SimpleSwitchP4RuntimeAPI(device_id=1, grpc_port=9559,
+                     p4rt_path='p4src/merge_p4rt.txt',
+                     json_path='p4src/merge.json')
+
+    api_path_a = SimpleSwitchP4RuntimeAPI(device_id=2, grpc_port=9560,
+                     p4rt_path='p4src/detector_p4rt.txt',
+                     json_path='p4src/detector.json')
+
+    api_path_b = SimpleSwitchP4RuntimeAPI(device_id=3, grpc_port=9561,
+                     p4rt_path='p4src/simple_p4rt.txt',
+                     json_path='p4src/simple.json')
+
+    # this goes ONLY to path_a_sw
+    api_path_a.table_add('MyIngress.l2_forward',
+                         'MyIngress.forward', ['aa:00:00:00:00:00'], ['2'])
+
+    # this goes ONLY to path_b_sw — completely separate
+    api_path_b.table_add('MyIngress.l2_forward',
+                         'MyIngress.forward', ['aa:00:00:00:00:00'], ['1'])
+
+    # this goes ONLY to merge_sw
+    api_merge.table_add('MyIngress.l2_forward',
+                        'MyIngress.forward', ['aa:00:00:00:00:01'], ['1'])
+
+IS IT COMPLEX TO CODE? No. Same pattern as current controller,
+just repeated three times on three API objects.
+
+Port maps per switch (example):
+
+    PATH_A_PORTS = {'h0': 2, 'merge_sw': 1}
+    PATH_B_PORTS = {'h0': 1, 'merge_sw': 2}
+    MERGE_PORTS  = {
+        'h1': 1, 'h2': 2, 'h3': 3,
+        'h4': 4, 'h5': 5,
+        'path_a_sw': 6, 'path_b_sw': 7
+    }
+
+    for host, port in PATH_A_PORTS.items():
+        api_path_a.table_add('MyIngress.l2_forward',
+                             'MyIngress.forward', [mac], [str(port)])
+
+    for host, port in PATH_B_PORTS.items():
+        api_path_b.table_add('MyIngress.l2_forward',
+                             'MyIngress.forward', [mac], [str(port)])
+
+----------------------------------------------------------------
+QUESTION 2: CAN DIFFERENT SWITCHES RUN DIFFERENT P4 PROGRAMS?
+----------------------------------------------------------------
+
+YES. In p4utils you call setP4Source() per switch instead of
+setP4SourceAll(). Each switch gets its own P4 program compiled
+separately.
+
+In network.py:
+
+    # WRONG — same program for all switches
+    net.setP4SourceAll('p4src/detector.p4')
+
+    # CORRECT — different program per switch
+    net.setP4Source('merge_sw',  'p4src/merge.p4')
+    net.setP4Source('path_a_sw', 'p4src/detector.p4')
+    net.setP4Source('path_b_sw', 'p4src/detector.p4')  # same file as path_a
+
+p4utils compiles each P4 file separately and generates:
+    p4src/merge.json     + merge_p4rt.txt
+    p4src/detector.json  + detector_p4rt.txt
+    (path_b reuses same compiled output as path_a — this is fine)
+
+Each BMv2 process loads its own binary. They never interfere.
+
+----------------------------------------------------------------
+QUESTION 3: DOES network.py COMPILE ALL P4 FILES AUTOMATICALLY?
+----------------------------------------------------------------
+
+YES. When you call:
+
+    net.setP4Source('merge_sw',  'p4src/merge.p4')
+    net.setP4Source('path_a_sw', 'p4src/detector.p4')
+    net.setP4Source('path_b_sw', 'p4src/simple_forward.p4')
+    net.setCompiler(p4rt=True)
+
+p4utils compiles ALL three P4 files automatically when you run
+sudo python3 network.py. You do not need to manually compile
+anything. Each switch gets its own .json and _p4rt.txt output.
+
+----------------------------------------------------------------
+QUESTION 4: CAN merge_sw HAVE HARDCODED RULES WITHOUT CONTROLLER?
+----------------------------------------------------------------
+
+YES. P4 supports const entries — static table entries baked
+directly into the compiled binary at compile time. No controller,
+no runtime population needed.
+
+In merge.p4:
+
+    table tcp_split {
+        key = { hdr.tcp.flags: ternary; }
+        actions = { send_to_path_a; send_to_path_b; }
+        const entries = {
+            // SYN=1 ACK=0 → path A (detection switch)
+            (9w0x002 &&& 9w0x012) : send_to_path_a();
+            // ACK=1 (any) → path B (simple forward switch)
+            (9w0x010 &&& 9w0x010) : send_to_path_b();
+        }
+    }
+
+This compiles the routing decision into the binary.
+merge_sw starts and immediately knows what to do.
+No controller needed for this table.
+
+L2 forwarding table on merge_sw still needs controller
+to populate host MAC → port mappings.
+
+----------------------------------------------------------------
+P4 FILES NEEDED
+----------------------------------------------------------------
+
+p4src/
+├── detector.p4        → path_a_sw AND path_b_sw (same code, both switches)
+└── merge.p4           → merge_sw  (TCP flag split routing, ~80 lines)
+
+NOTE: path_a_sw and path_b_sw run the SAME detector.p4.
+In network.py:
+    net.setP4Source('path_a_sw', 'p4src/detector.p4')
+    net.setP4Source('path_b_sw', 'p4src/detector.p4')
+This is valid — two switches can share the same P4 source file.
+
+----------------------------------------------------------------
+CONTROLLER STRUCTURE
+----------------------------------------------------------------
+
+One controller.py file, three API objects:
+
+    class AsymmetricController:
+        def __init__(self):
+            self.api_merge  = SimpleSwitchP4RuntimeAPI(...)  # merge_sw
+            self.api_path_a = SimpleSwitchP4RuntimeAPI(...)  # path_a_sw
+            self.api_path_b = SimpleSwitchP4RuntimeAPI(...)  # path_b_sw
+
+        def _install_forwarding_rules(self):
+            # push different rules to each switch
+            self._install_merge_rules()
+            self._install_path_a_rules()
+            self._install_path_b_rules()
+
+        def _recv_digest(self):
+            # digests come from BOTH path_a_sw and path_b_sw
+            # path_a_sw sends THRESHOLD digest on SYN surge
+            # path_b_sw sends THRESHOLD digest on ACK surge
+            # run separate receiver threads for each
+            threading.Thread(target=self._recv_from, args=('path_a',)).start()
+            threading.Thread(target=self._recv_from, args=('path_b',)).start()
+
+        def _push_block_rule(self, src_ip):
+            # block on path_a_sw (SYNs arrive here)
+            # path_b_sw block optional — ACKs alone are not the threat
+            api_path_a.table_add('MyIngress.dangerous_table', ...)
+
+----------------------------------------------------------------
+GRPC AND THRIFT PORTS — MUST BE UNIQUE PER SWITCH
+----------------------------------------------------------------
+
+In network.py:
+
+    net.setGrpcPort('merge_sw',  9559)
+    net.setGrpcPort('path_a_sw', 9560)
+    net.setGrpcPort('path_b_sw', 9561)
+
+    net.setThriftPort('merge_sw',  9090)
+    net.setThriftPort('path_a_sw', 9091)
+    net.setThriftPort('path_b_sw', 9092)
+
+----------------------------------------------------------------
+SUMMARY
+----------------------------------------------------------------
+
+Question                                    Answer
+------------------------------------------  --------------------
+Can one controller push different rules     YES — one API object
+to different switches?                      per switch, table_add
+                                            goes to that switch only
+
+Is it complex to code?                      NO — same pattern
+                                            repeated per switch
+
+Can different switches run different        YES — setP4Source()
+P4 programs?                               per switch in network.py
+
+Does network.py compile all P4 files?       YES — automatically
+                                            when sudo python3
+                                            network.py runs
+
+Can merge_sw have hardcoded rules?          YES — const entries
+                                            in P4 bakes rules
+                                            into compiled binary
+
+Do you need two separate controllers?       NO — one controller
+                                            with three API objects
+
+================================================================

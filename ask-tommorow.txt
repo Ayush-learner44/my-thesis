@@ -1,0 +1,11 @@
+*** Starting CLI:
+mininet> xterm h0
+mininet> py exec(open('/home/ayush/my/flooding.py').read())
+name 'threading' is not defined
+mininet>  py exec(open('/home/ayush/my/flooding.py').read())
+[flooding] Launching flood.py on ['h1', 'h2', 'h3', 'h4', 'h5'] simultaneously...
+name 'net' is not defined
+mininet>  py exec(open('/home/ayush/my/flooding.py').read())
+[flooding] Launching flood.py on ['h1', 'h2', 'h3', 'h4', 'h5'] simultaneously...
+name 'net' is not defined
+mininet>
