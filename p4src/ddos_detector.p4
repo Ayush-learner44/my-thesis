@@ -223,8 +223,12 @@ control MyIngress(inout headers_t hdr,
                     });
                 }
 
-            // Step 5b: ACK set (pure ACK or SYN-ACK) — decrement CMS, floor at 0
-            } else if ((hdr.tcp.flags & TCP_ACK) != 0) {
+            // Step 5b: pure ACK only (ACK=1, SYN=0) — decrement CMS, floor at 0
+            // SYN-ACK is excluded: it would hash to server's direction (different bucket)
+            // but SYN-ACK retransmits from h0 can randomly collide with attacker buckets,
+            // causing the counter to drift down and delaying detection significantly.
+            } else if ((hdr.tcp.flags & TCP_ACK) != 0 &&
+                       (hdr.tcp.flags & TCP_SYN) == 0) {
 
                 cms_row0.read(c0, idx0);
                 cms_row1.read(c1, idx1);

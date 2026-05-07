@@ -1,27 +1,33 @@
 """
-flood.py — Flash crowd simulation
-Self-assigns IPv6 if p4-utils didn't. Fires simultaneous TCP connections.
+flood.py — Realistic flash crowd simulation with mixed traffic pattern.
+Self-assigns IPv6 if p4-utils didn't.
+
+Traffic pattern (200 total connections):
+  Phase 1 —  70 simultaneous burst   (viral link / event spike)
+  Phase 2 —  70 sequential @ 10/sec  (sustained high-interest traffic)
+  Phase 3 —  30 simultaneous burst   (second spike / retweet wave)
+  Phase 4 —  30 sequential @ random  (traffic settling back down)
+
+All phases use real TCP connections — ACKs always cancel SYNs in CMS,
+so the counter never cleanly accumulates to 64 regardless of rate.
+Sequential phases are inherently safe: counter bounces 0→1→0 per connection.
+
 Run from any legit host xterm:
     python3 /home/ayush/my/flood.py
 """
 
-import socket, re, subprocess, threading
+import socket, re, subprocess, threading, time, random
 
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.disable_ipv6=0'], capture_output=True)
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'], capture_output=True)
 
-VICTIM_IP  = "2001:1:1::10"      # h0 IPv6 — matches network.py
-VICTIM_MAC = "aa:00:00:00:00:00" # h0 MAC  — matches network.py
+VICTIM_IP  = "2001:1:1::10"
+VICTIM_MAC = "aa:00:00:00:00:00"
 DST_PORT   = 80
-BURST_SIZE = 100
 
 IPV6_MAP = {
-    'h0': '2001:1:1::10',
-    'h1': '2001:1:1::1',
-    'h2': '2001:1:1::2',
-    'h3': '2001:1:1::3',
-    'h4': '2001:1:1::4',
-    'h5': '2001:1:1::5',
+    'h0': '2001:1:1::10', 'h1': '2001:1:1::1', 'h2': '2001:1:1::2',
+    'h3': '2001:1:1::3',  'h4': '2001:1:1::4', 'h5': '2001:1:1::5',
 }
 
 def get_iface_info():
@@ -51,13 +57,12 @@ def get_iface_info():
 
 iface, my_ipv6 = get_iface_info()
 
-# Static neighbor entry for h0 — bypasses NDP
 if iface:
     subprocess.run(['ip', '-6', 'neigh', 'replace', VICTIM_IP,
                     'lladdr', VICTIM_MAC, 'dev', iface, 'nud', 'permanent'],
                    capture_output=True)
 
-def single_connection(idx):
+def single_connection():
     try:
         s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
         s.settimeout(3)
@@ -68,15 +73,35 @@ def single_connection(idx):
     except Exception:
         pass
 
+def burst(n, label):
+    print(f"[flood] {label}: firing {n} simultaneous connections...")
+    threads = [threading.Thread(target=single_connection) for _ in range(n)]
+    for t in threads: t.start()
+    for t in threads: t.join()
+    print(f"[flood] {label}: done")
+
 print(f"[flood] Host  : {my_ipv6}")
 print(f"[flood] Target: {VICTIM_IP}:{DST_PORT}")
-print(f"[flood] Firing {BURST_SIZE} simultaneous connections (flash crowd)...")
+print(f"[flood] Pattern: 70 burst → 70 @ 10/sec → 30 burst → 30 @ random")
 
-threads = [threading.Thread(target=single_connection, args=(i,))
-           for i in range(BURST_SIZE)]
-for t in threads:
-    t.start()
-for t in threads:
-    t.join()
+# Phase 1: 70 simultaneous burst
+burst(70, "Phase-1 burst")
 
-print(f"[flood] Done — {BURST_SIZE} simultaneous connections from {my_ipv6}")
+# Phase 2: 70 sequential at 10/sec (faster than traffic.py but safe — ACKs cancel SYNs)
+print(f"[flood] Phase-2: 70 connections at 10/sec...")
+for i in range(70):
+    single_connection()
+    time.sleep(0.1)
+print(f"[flood] Phase-2: done")
+
+# Phase 3: 30 simultaneous burst
+burst(30, "Phase-3 burst")
+
+# Phase 4: 30 at random speed between 5–15/sec (0.067–0.2s interval)
+print(f"[flood] Phase-4: 30 connections at random speed (5–15/sec)...")
+for i in range(30):
+    single_connection()
+    time.sleep(random.uniform(0.067, 0.2))
+print(f"[flood] Phase-4: done")
+
+print(f"[flood] Done — 200 connections total from {my_ipv6}")

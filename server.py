@@ -1,22 +1,23 @@
 """
 server.py — Simple IPv6 TCP server for h0
 Self-assigns h0's IPv6 if p4-utils didn't. Listens on port 80.
+Automatically starts tcpdump on h0-eth0 and saves capture.pcap to
+/home/ayush/my/ when Ctrl+C is pressed.
+
 Run on h0 xterm BEFORE firing any traffic:
     python3 /home/ayush/my/server.py
 """
 
-import socket, threading, re, subprocess
+import socket, threading, re, subprocess, time
 
-# Enable IPv6 in this namespace (WSL2 disables it on new veth interfaces)
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.disable_ipv6=0'], capture_output=True)
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'], capture_output=True)
 
-HOST  = "::"   # listen on all IPv6 interfaces
-PORT  = 80
-H0_IPV6 = "2001:1:1::10"   # h0 IPv6 — matches network.py
+HOST      = "::"
+PORT      = 80
+H0_IPV6   = "2001:1:1::10"
+PCAP_PATH = "/home/ayush/my/capture.pcap"
 
-# Client MACs and IPv6s for static neighbor entries
-# (h0 needs these to send SYN-ACK without NDP)
 CLIENT_NEIGHBORS = {
     '2001:1:1::1': 'aa:00:00:00:00:01',
     '2001:1:1::2': 'aa:00:00:00:00:02',
@@ -36,19 +37,35 @@ def get_iface():
     return None
 
 def setup(iface):
-    # Self-assign h0's IPv6 if p4-utils didn't
     result = subprocess.run(['ip', '-6', 'addr', 'show', iface], capture_output=True, text=True)
     if H0_IPV6 not in result.stdout:
-        subprocess.run(['ip', '-6', 'addr', 'add', H0_IPV6 + '/64', 'dev', iface],
+        subprocess.run(['ip', '-6', 'addr', 'add', 'nodad', H0_IPV6 + '/64', 'dev', iface],
                        capture_output=True)
-        print(f"[server] Assigned {H0_IPV6}/64 to {iface}")
-
-    # Static neighbor entries for all clients — bypasses NDP
+        print(f"[server] Assigned {H0_IPV6}/64 to {iface} (nodad)")
     for ip, mac in CLIENT_NEIGHBORS.items():
         subprocess.run(['ip', '-6', 'neigh', 'replace', ip,
                         'lladdr', mac, 'dev', iface, 'nud', 'permanent'],
                        capture_output=True)
     print(f"[server] Static neighbor entries installed for all clients on {iface}")
+
+def _monitor_synrecv():
+    prev = 0
+    while True:
+        try:
+            r = subprocess.run(['ss', '-6', '-n', 'state', 'syn-recv'],
+                               capture_output=True, text=True)
+            lines = [l for l in r.stdout.strip().split('\n')
+                     if l and 'Recv-Q' not in l]
+            count = len(lines)
+            if count != prev:
+                if count > 0:
+                    print(f"[server] *** ATTACK TRAFFIC: {count} half-open SYNs hitting h0 ***")
+                elif prev > 0:
+                    print(f"[server] Attack stopped — half-open connections cleared (block rule working)")
+                prev = count
+        except Exception:
+            pass
+        time.sleep(0.3)
 
 def handle(conn, addr):
     stats['connections'] += 1
@@ -66,6 +83,20 @@ def start():
     if iface:
         setup(iface)
 
+    # Start tcpdump before listening so no packets are missed
+    tcpdump_proc = None
+    if iface:
+        tcpdump_proc = subprocess.Popen(
+            ['tcpdump', '-i', iface, '-w', PCAP_PATH],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(0.3)   # let tcpdump open and start capturing
+        print(f"[server] tcpdump capturing on {iface} -> {PCAP_PATH}")
+    else:
+        print("[server] WARNING: no interface detected — tcpdump not started")
+
+    threading.Thread(target=_monitor_synrecv, daemon=True).start()
+
     s = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((HOST, PORT))
@@ -75,11 +106,14 @@ def start():
     try:
         while True:
             conn, addr = s.accept()
-            t = threading.Thread(target=handle, args=(conn, addr), daemon=True)
-            t.start()
+            threading.Thread(target=handle, args=(conn, addr), daemon=True).start()
     except KeyboardInterrupt:
         print(f"\n[server] Done. Total connections served: {stats['connections']}")
         s.close()
+        if tcpdump_proc:
+            tcpdump_proc.terminate()
+            tcpdump_proc.wait()
+            print(f"[server] Capture saved -> {PCAP_PATH}")
 
 if __name__ == '__main__':
     start()

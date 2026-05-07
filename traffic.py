@@ -15,7 +15,7 @@ VICTIM_IP  = "2001:1:1::10"      # h0 IPv6 — matches network.py
 VICTIM_MAC = "aa:00:00:00:00:00" # h0 MAC  — matches network.py
 DST_PORT   = 80
 NUM_CONNS  = 60
-INTER      = 0.5   # 2 connections per second
+INTER      = 0.333  # 3 connections per second
 
 # Must match network.py setIntfIp values
 IPV6_MAP = {
@@ -80,7 +80,7 @@ def legit_connection(idx):
 
 print(f"[traffic] Host  : {my_ipv6}")
 print(f"[traffic] Target: {VICTIM_IP}:{DST_PORT}")
-print(f"[traffic] Sending {NUM_CONNS} legitimate connections at 2/sec...")
+print(f"[traffic] Sending {NUM_CONNS} legitimate connections at 3/sec...")
 
 for i in range(NUM_CONNS):
     legit_connection(i)

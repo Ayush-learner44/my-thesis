@@ -58,4 +58,39 @@ net.setGrpcPort('s1', 9559)
 # net.enableLogAll()
 # net.enablePcapDumpAll()
 net.enableCli()
+
+print("""
+\033[1;36m
+================================================================
+  EXPERIMENT QUICK REFERENCE  (scroll up if buried)
+================================================================
+
+  STEP 1 — CONTROLLER  (separate Linux terminal, run first):
+    cd /home/ayush/my/controller
+    python3 controller.py
+
+  STEP 2 — SERVER  (open h0 xterm, run before traffic):
+    xterm h0
+    python3 /home/ayush/my/server.py
+
+  STEP 3 — TRAFFIC  (paste into mininet CLI below):
+
+    run_all.py    h1+h2 SYN flood  |  h3+h4+h5 legit
+      py exec(open('/home/ayush/my/run_all.py').read(), {'net': net, '__builtins__': __builtins__})
+
+    attacks.py    all 5 hosts SYN flood
+      py exec(open('/home/ayush/my/attacks.py').read(), {'net': net, '__builtins__': __builtins__})
+
+    flooding.py   all 5 hosts flash crowd (legit burst)
+      py exec(open('/home/ayush/my/flooding.py').read(), {'net': net, '__builtins__': __builtins__})
+
+    legit-traffic.py   all 5 hosts slow legit traffic
+      py exec(open('/home/ayush/my/legit-traffic.py').read(), {'net': net, '__builtins__': __builtins__})
+
+  STEP 4 — VERIFY  (Ctrl+C server.py first, then):
+    python3 /home/ayush/my/verify.py
+
+================================================================\033[0m
+""")
+
 net.startNetwork()

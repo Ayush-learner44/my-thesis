@@ -259,7 +259,7 @@
       "id" : 0,
       "source_info" : {
         "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-        "line" : 264,
+        "line" : 268,
         "column" : 8,
         "source_fragment" : "MyDeparser"
       },
@@ -1059,7 +1059,7 @@
       ]
     },
     {
-      "name" : "ddos_detector232",
+      "name" : "ddos_detector236",
       "id" : 13,
       "runtime_data" : [],
       "primitives" : [
@@ -1100,7 +1100,7 @@
           ],
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 232,
+            "line" : 236,
             "column" : 51,
             "source_fragment" : "c0 - 1"
           }
@@ -1123,7 +1123,7 @@
           ],
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 232,
+            "line" : 236,
             "column" : 30,
             "source_fragment" : "cms_row0.write(idx0, c0 - 1)"
           }
@@ -1131,7 +1131,7 @@
       ]
     },
     {
-      "name" : "ddos_detector229",
+      "name" : "ddos_detector233",
       "id" : 14,
       "runtime_data" : [],
       "primitives" : [
@@ -1153,7 +1153,7 @@
           ],
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 229,
+            "line" : 233,
             "column" : 16,
             "source_fragment" : "cms_row0.read(c0, idx0)"
           }
@@ -1176,7 +1176,7 @@
           ],
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 230,
+            "line" : 234,
             "column" : 16,
             "source_fragment" : "cms_row1.read(c1, idx1)"
           }
@@ -1184,7 +1184,7 @@
       ]
     },
     {
-      "name" : "ddos_detector233",
+      "name" : "ddos_detector237",
       "id" : 15,
       "runtime_data" : [],
       "primitives" : [
@@ -1225,7 +1225,7 @@
           ],
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 233,
+            "line" : 237,
             "column" : 51,
             "source_fragment" : "c1 - 1"
           }
@@ -1248,7 +1248,7 @@
           ],
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 233,
+            "line" : 237,
             "column" : 30,
             "source_fragment" : "cms_row1.write(idx1, c1 - 1)"
           }
@@ -1774,11 +1774,11 @@
           }
         },
         {
-          "name" : "tbl_ddos_detector229",
+          "name" : "tbl_ddos_detector233",
           "id" : 10,
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 229,
+            "line" : 233,
             "column" : 16,
             "source_fragment" : "cms_row0.read(c0, idx0); ..."
           },
@@ -1790,10 +1790,10 @@
           "support_timeout" : false,
           "direct_meters" : null,
           "action_ids" : [14],
-          "actions" : ["ddos_detector229"],
+          "actions" : ["ddos_detector233"],
           "base_default_next" : "node_21",
           "next_tables" : {
-            "ddos_detector229" : "node_21"
+            "ddos_detector233" : "node_21"
           },
           "default_entry" : {
             "action_id" : 14,
@@ -1803,11 +1803,11 @@
           }
         },
         {
-          "name" : "tbl_ddos_detector232",
+          "name" : "tbl_ddos_detector236",
           "id" : 11,
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 232,
+            "line" : 236,
             "column" : 30,
             "source_fragment" : "cms_row0.write(idx0, c0 - 1)"
           },
@@ -1819,10 +1819,10 @@
           "support_timeout" : false,
           "direct_meters" : null,
           "action_ids" : [13],
-          "actions" : ["ddos_detector232"],
+          "actions" : ["ddos_detector236"],
           "base_default_next" : "node_23",
           "next_tables" : {
-            "ddos_detector232" : "node_23"
+            "ddos_detector236" : "node_23"
           },
           "default_entry" : {
             "action_id" : 13,
@@ -1832,11 +1832,11 @@
           }
         },
         {
-          "name" : "tbl_ddos_detector233",
+          "name" : "tbl_ddos_detector237",
           "id" : 12,
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 233,
+            "line" : 237,
             "column" : 30,
             "source_fragment" : "cms_row1.write(idx1, c1 - 1)"
           },
@@ -1848,10 +1848,10 @@
           "support_timeout" : false,
           "direct_meters" : null,
           "action_ids" : [15],
-          "actions" : ["ddos_detector233"],
+          "actions" : ["ddos_detector237"],
           "base_default_next" : "MyIngress.l2_forward",
           "next_tables" : {
-            "ddos_detector233" : "MyIngress.l2_forward"
+            "ddos_detector237" : "MyIngress.l2_forward"
           },
           "default_entry" : {
             "action_id" : 15,
@@ -2180,35 +2180,65 @@
           "id" : 7,
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 227,
+            "line" : 230,
             "column" : 23,
-            "source_fragment" : "(hdr.tcp.flags & TCP_ACK) != 0"
+            "source_fragment" : "(hdr.tcp.flags & TCP_ACK) != 0 && ..."
           },
           "expression" : {
             "type" : "expression",
             "value" : {
-              "op" : "!=",
+              "op" : "and",
               "left" : {
                 "type" : "expression",
                 "value" : {
-                  "op" : "&",
+                  "op" : "!=",
                   "left" : {
-                    "type" : "field",
-                    "value" : ["tcp", "flags"]
+                    "type" : "expression",
+                    "value" : {
+                      "op" : "&",
+                      "left" : {
+                        "type" : "field",
+                        "value" : ["tcp", "flags"]
+                      },
+                      "right" : {
+                        "type" : "hexstr",
+                        "value" : "0x0010"
+                      }
+                    }
                   },
                   "right" : {
                     "type" : "hexstr",
-                    "value" : "0x0010"
+                    "value" : "0x0000"
                   }
                 }
               },
               "right" : {
-                "type" : "hexstr",
-                "value" : "0x0000"
+                "type" : "expression",
+                "value" : {
+                  "op" : "==",
+                  "left" : {
+                    "type" : "expression",
+                    "value" : {
+                      "op" : "&",
+                      "left" : {
+                        "type" : "field",
+                        "value" : ["tcp", "flags"]
+                      },
+                      "right" : {
+                        "type" : "hexstr",
+                        "value" : "0x0002"
+                      }
+                    }
+                  },
+                  "right" : {
+                    "type" : "hexstr",
+                    "value" : "0x0000"
+                  }
+                }
               }
             }
           },
-          "true_next" : "tbl_ddos_detector229",
+          "true_next" : "tbl_ddos_detector233",
           "false_next" : "MyIngress.l2_forward"
         },
         {
@@ -2216,7 +2246,7 @@
           "id" : 8,
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 232,
+            "line" : 236,
             "column" : 20,
             "source_fragment" : "c0 > 0"
           },
@@ -2234,7 +2264,7 @@
               }
             }
           },
-          "true_next" : "tbl_ddos_detector232",
+          "true_next" : "tbl_ddos_detector236",
           "false_next" : "node_23"
         },
         {
@@ -2242,7 +2272,7 @@
           "id" : 9,
           "source_info" : {
             "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-            "line" : 233,
+            "line" : 237,
             "column" : 20,
             "source_fragment" : "c1 > 0"
           },
@@ -2260,7 +2290,7 @@
               }
             }
           },
-          "true_next" : "tbl_ddos_detector233",
+          "true_next" : "tbl_ddos_detector237",
           "false_next" : "MyIngress.l2_forward"
         }
       ]
@@ -2270,7 +2300,7 @@
       "id" : 1,
       "source_info" : {
         "filename" : "/home/ayush/my/p4src/ddos_detector.p4",
-        "line" : 246,
+        "line" : 250,
         "column" : 8,
         "source_fragment" : "MyEgress"
       },

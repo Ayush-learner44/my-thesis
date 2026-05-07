@@ -281,12 +281,12 @@ class DDoSController:
         is_attack, votes, total = self.ensemble.predict(pps)
 
         log.info(f"THRESHOLD   {src_ip} -> :{dst_port}  cms_min={cms_min}  "
-                 f"elapsed={elapsed:.3f}s  pps={pps:.1f}  vote={votes}/{total}")
+                 f"elapsed={elapsed:.3f}s  vote={votes}/{total}")
 
         if is_attack:
             log.warning("=" * 60)
             log.warning(f"ATTACK DETECTED: {src_ip}")
-            log.warning(f"  cms_min={cms_min}  pps={pps:.1f}  vote={votes}/{total}")
+            log.warning(f"  cms_min={cms_min}  vote={votes}/{total}")
             log.warning(f"  -> installing drop rule on all switches")
             log.warning("=" * 60)
             with self._lock:
@@ -294,7 +294,11 @@ class DDoSController:
                 self.stats['attacks'] += 1
             self._push_block_rule(src_ip)
         else:
-            log.info(f"BENIGN: {src_ip} ({pps:.1f} pps) -> allowed")
+            log.info("=" * 60)
+            log.info(f"BENIGN: {src_ip}")
+            log.info(f"  cms_min={cms_min}  vote={votes}/{total}")
+            log.info(f"  -> allowed, no action taken")
+            log.info("=" * 60)
             with self._lock:
                 self.stats['benign'] += 1
 
