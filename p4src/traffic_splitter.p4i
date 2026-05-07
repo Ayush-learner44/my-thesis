@@ -1,7 +1,7 @@
-# 0 "/home/ayush/my/p4src/ddos_detector.p4"
+# 0 "/home/ayush/my/p4src/traffic_splitter.p4"
 # 0 "<built-in>"
 # 0 "<command-line>"
-# 1 "/home/ayush/my/p4src/ddos_detector.p4"
+# 1 "/home/ayush/my/p4src/traffic_splitter.p4"
 # 1 "/usr/local/share/p4c/p4include/core.p4" 1
 /*
 Copyright 2013-present Barefoot Networks, Inc.
@@ -96,7 +96,7 @@ extern bool static_assert(bool check, string message);
 
 /// Like the above but using a default message.
 extern bool static_assert(bool check);
-# 2 "/home/ayush/my/p4src/ddos_detector.p4" 2
+# 2 "/home/ayush/my/p4src/traffic_splitter.p4" 2
 # 1 "/usr/local/share/p4c/p4include/v1model.p4" 1
 /*
 Copyright 2013-present Barefoot Networks, Inc.
@@ -882,7 +882,7 @@ package V1Switch<H, M>(Parser<H, M> p,
                        ComputeChecksum<H, M> ck,
                        Deparser<H> dep
                        );
-# 3 "/home/ayush/my/p4src/ddos_detector.p4" 2
+# 3 "/home/ayush/my/p4src/traffic_splitter.p4" 2
 
 // ================================================================
 // CONSTANTS
@@ -892,7 +892,12 @@ const bit<16> ETHERTYPE_IPV6 = 0x86DD;
 const bit<8> PROTO_TCP = 6;
 const bit<9> TCP_SYN = 9w0x002;
 const bit<9> TCP_ACK = 9w0x010;
-const bit<32> CMS_COLUMNS = 1024;
+
+// Ports on merge_sw facing each downstream switch.
+// These must match the port1= values in network.py addLink calls.
+// h1-h5 are on ports 1-5; path_a_sw on port 6; path_b_sw on port 7.
+const bit<9> PATH_A_PORT = 6; // pure SYN traffic → detector switch
+const bit<9> PATH_B_PORT = 7; // ACK / other traffic → passthrough switch
 
 // ================================================================
 // HEADERS
@@ -935,39 +940,6 @@ struct headers_t {
 }
 
 struct metadata_t { }
-
-// ================================================================
-// DIGESTS
-// ================================================================
-
-// Sent on the first SYN of a new flow (at least one CMS row is zero before increment)
-struct first_seen_digest_t {
-    bit<128> src_ip;
-    bit<128> dst_ip;
-    bit<16> dst_port;
-    bit<8> protocol;
-    bit<48> timestamp;
-}
-
-// Sent every 64 SYNs for a flow (cms_min hits an exact multiple of 64)
-struct threshold_digest_t {
-    bit<128> src_ip;
-    bit<128> dst_ip;
-    bit<16> dst_port;
-    bit<8> protocol;
-    bit<32> cms_min;
-    bit<48> timestamp;
-}
-
-// Sent from the ACK branch when c0==0 OR c1==0 (can't decrement)
-// Signals that an ACK arrived for a flow whose SYN took a different path —
-// evidence of asymmetric routing. No timestamp needed; controller only counts.
-struct evidence_digest_t {
-    bit<128> src_ip;
-    bit<128> dst_ip;
-    bit<16> dst_port;
-    bit<8> protocol;
-}
 
 // ================================================================
 // PARSER
@@ -1013,10 +985,6 @@ control MyIngress(inout headers_t hdr,
                   inout metadata_t meta,
                   inout standard_metadata_t standard_metadata) {
 
-    // Count-Min Sketch: 2 rows x 1024 columns, 32-bit counters
-    register<bit<32>>(CMS_COLUMNS) cms_row0; // indexed by CRC16
-    register<bit<32>>(CMS_COLUMNS) cms_row1; // indexed by CRC32
-
     action drop() {
         mark_to_drop(standard_metadata);
     }
@@ -1025,17 +993,8 @@ control MyIngress(inout headers_t hdr,
         standard_metadata.egress_spec = port;
     }
 
-    // Step 1 — block known-attack source IPv6 addresses
-    // Controller installs entries with drop action when ML predicts ATTACK
-    table dangerous_table {
-        key = { hdr.ipv6.srcAddr: exact; }
-        actions = { drop; NoAction; }
-        size = 1024;
-        default_action = NoAction();
-    }
-
-    // Step 8 — L2 forwarding by destination MAC
-    // Controller installs rules at startup for all hosts
+    // Controller installs MAC → port mappings for all hosts and switches.
+    // Used for return traffic (server → clients) going through this switch.
     table l2_forward {
         key = { hdr.ethernet.dstAddr: exact; }
         actions = { forward; drop; NoAction; }
@@ -1045,106 +1004,36 @@ control MyIngress(inout headers_t hdr,
 
     apply {
 
-        // Step 1: drop immediately if src IPv6 is in blocklist
-        if (hdr.ipv6.isValid()) {
-            if (dangerous_table.apply().hit) {
-                return;
-            }
-        }
+        if (standard_metadata.ingress_port == PATH_A_PORT ||
+            standard_metadata.ingress_port == PATH_B_PORT) {
 
-        // Steps 2-7: detection logic — IPv6 TCP packets only
-        if (hdr.ipv6.isValid() && hdr.tcp.isValid()) {
+            // ── Return path ───────────────────────────────────────────
+            // Traffic arriving FROM path_a_sw or path_b_sw is server→client
+            // return traffic (SYN-ACK, data, FIN).  Just L2-forward it to
+            // the correct host — no flag-based splitting.
+            l2_forward.apply();
 
-            // Steps 3-4: hash 5-tuple into two CMS row indices
-            bit<32> idx0;
-            bit<32> idx1;
-            hash(idx0, HashAlgorithm.crc16, (bit<32>)0,
-                 { hdr.ipv6.srcAddr, hdr.ipv6.dstAddr,
-                   hdr.tcp.dstPort,
-                   hdr.ipv6.nextHdr },
-                 CMS_COLUMNS);
-            hash(idx1, HashAlgorithm.crc32, (bit<32>)0,
-                 { hdr.ipv6.srcAddr, hdr.ipv6.dstAddr,
-                   hdr.tcp.dstPort,
-                   hdr.ipv6.nextHdr },
-                 CMS_COLUMNS);
+        } else {
 
-            bit<32> c0;
-            bit<32> c1;
+            // ── Host → server path ────────────────────────────────────
+            // Traffic arriving from any host port (1-5).
+            // Split by TCP flags: pure SYN goes to detector, everything
+            // else (SYN-ACK, ACK, FIN, data) goes to the passthrough switch.
 
-            // Step 5a: pure SYN (SYN=1, ACK=0) — increment CMS
-            if ((hdr.tcp.flags & TCP_SYN) != 0 &&
+            if (hdr.tcp.isValid() &&
+                (hdr.tcp.flags & TCP_SYN) != 0 &&
                 (hdr.tcp.flags & TCP_ACK) == 0) {
 
-                cms_row0.read(c0, idx0);
-                cms_row1.read(c1, idx1);
+                // Pure SYN → path_a_sw (detector with CMS)
+                standard_metadata.egress_spec = PATH_A_PORT;
 
-                // FIRST_SEEN: at least one CMS slot is zero → new flow
-                if (c0 == 0 || c1 == 0) {
-                    digest<first_seen_digest_t>(1, {
-                        hdr.ipv6.srcAddr,
-                        hdr.ipv6.dstAddr,
-                        hdr.tcp.dstPort,
-                        hdr.ipv6.nextHdr,
-                        standard_metadata.ingress_global_timestamp
-                    });
-                }
+            } else {
 
-                c0 = c0 + 1;
-                c1 = c1 + 1;
-                cms_row0.write(idx0, c0);
-                cms_row1.write(idx1, c1);
+                // Everything else → path_b_sw (simple passthrough)
+                standard_metadata.egress_spec = PATH_B_PORT;
 
-                // Step 6: cms_min = min of the two post-increment counts
-                bit<32> cms_min;
-                if (c0 < c1) {
-                    cms_min = c0;
-                } else {
-                    cms_min = c1;
-                }
-
-                // Step 7: fire THRESHOLD digest every 64 SYNs
-                // bitmask & 0x3F == 0 iff cms_min is an exact multiple of 64
-                if ((cms_min & 32w0x3F) == 0 && cms_min > 0) {
-                    digest<threshold_digest_t>(1, {
-                        hdr.ipv6.srcAddr,
-                        hdr.ipv6.dstAddr,
-                        hdr.tcp.dstPort,
-                        hdr.ipv6.nextHdr,
-                        cms_min,
-                        standard_metadata.ingress_global_timestamp
-                    });
-                }
-
-            // Step 5b: pure ACK only (ACK=1, SYN=0) — decrement CMS, floor at 0
-            // SYN-ACK is excluded: it would hash to server's direction (different bucket)
-            // but SYN-ACK retransmits from h0 can randomly collide with attacker buckets,
-            // causing the counter to drift down and delaying detection significantly.
-            } else if ((hdr.tcp.flags & TCP_ACK) != 0 &&
-                       (hdr.tcp.flags & TCP_SYN) == 0) {
-
-                cms_row0.read(c0, idx0);
-                cms_row1.read(c1, idx1);
-
-                // EVIDENCE: at least one CMS row is zero — this switch never saw
-                // the SYN for this flow, so it arrived via the other path.
-                // OR condition: one collision-free row is enough to confirm asymmetry.
-                if (c0 == 0 || c1 == 0) {
-                    digest<evidence_digest_t>(1, {
-                        hdr.ipv6.srcAddr,
-                        hdr.ipv6.dstAddr,
-                        hdr.tcp.dstPort,
-                        hdr.ipv6.nextHdr
-                    });
-                }
-
-                if (c0 > 0) { cms_row0.write(idx0, c0 - 1); }
-                if (c1 > 0) { cms_row1.write(idx1, c1 - 1); }
             }
         }
-
-        // Step 8: forward all non-dropped packets via L2 table
-        l2_forward.apply();
     }
 }
 

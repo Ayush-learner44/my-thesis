@@ -125,7 +125,64 @@ digests {
     }
   }
 }
+digests {
+  preamble {
+    id: 394838695
+    name: "evidence_digest_t"
+    alias: "evidence_digest_t"
+  }
+  type_spec {
+    struct {
+      name: "evidence_digest_t"
+    }
+  }
+}
 type_info {
+  structs {
+    key: "evidence_digest_t"
+    value {
+      members {
+        name: "src_ip"
+        type_spec {
+          bitstring {
+            bit {
+              bitwidth: 128
+            }
+          }
+        }
+      }
+      members {
+        name: "dst_ip"
+        type_spec {
+          bitstring {
+            bit {
+              bitwidth: 128
+            }
+          }
+        }
+      }
+      members {
+        name: "dst_port"
+        type_spec {
+          bitstring {
+            bit {
+              bitwidth: 16
+            }
+          }
+        }
+      }
+      members {
+        name: "protocol"
+        type_spec {
+          bitstring {
+            bit {
+              bitwidth: 8
+            }
+          }
+        }
+      }
+    }
+  }
   structs {
     key: "first_seen_digest_t"
     value {

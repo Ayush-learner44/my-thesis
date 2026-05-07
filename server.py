@@ -16,7 +16,8 @@ subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'], capture
 HOST      = "::"
 PORT      = 80
 H0_IPV6   = "2001:1:1::10"
-PCAP_PATH = "/home/ayush/my/capture.pcap"
+PCAP_PATH_A = "/home/ayush/my/capture_path_a.pcap"  # eth0 — path_a_sw (SYNs)
+PCAP_PATH_B = "/home/ayush/my/capture_path_b.pcap"  # eth1 — path_b_sw (ACKs)
 
 CLIENT_NEIGHBORS = {
     '2001:1:1::1': 'aa:00:00:00:00:01',
@@ -35,6 +36,15 @@ def get_iface():
         if m:
             return m.group(1)
     return None
+
+def get_all_ifaces():
+    result = subprocess.run(['ip', 'link'], capture_output=True, text=True)
+    ifaces = []
+    for line in result.stdout.split('\n'):
+        m = re.search(r'\d+:\s+([\w-]+eth\d+)', line)
+        if m:
+            ifaces.append(m.group(1))
+    return ifaces
 
 def setup(iface):
     result = subprocess.run(['ip', '-6', 'addr', 'show', iface], capture_output=True, text=True)
@@ -83,17 +93,22 @@ def start():
     if iface:
         setup(iface)
 
-    # Start tcpdump before listening so no packets are missed
-    tcpdump_proc = None
-    if iface:
-        tcpdump_proc = subprocess.Popen(
-            ['tcpdump', '-i', iface, '-w', PCAP_PATH],
+    # Start tcpdump on every interface before listening so no packets are missed
+    pcap_paths = [PCAP_PATH_A, PCAP_PATH_B]
+    all_ifaces = get_all_ifaces()
+    tcpdump_procs = []
+    for i, ifc in enumerate(all_ifaces[:2]):
+        path = pcap_paths[i]
+        p = subprocess.Popen(
+            ['tcpdump', '-i', ifc, '-w', path],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
-        time.sleep(0.3)   # let tcpdump open and start capturing
-        print(f"[server] tcpdump capturing on {iface} -> {PCAP_PATH}")
+        tcpdump_procs.append((ifc, path, p))
+        print(f"[server] tcpdump capturing on {ifc} -> {path}")
+    if not tcpdump_procs:
+        print("[server] WARNING: no interfaces detected — tcpdump not started")
     else:
-        print("[server] WARNING: no interface detected — tcpdump not started")
+        time.sleep(0.3)   # let tcpdump open and start capturing
 
     threading.Thread(target=_monitor_synrecv, daemon=True).start()
 
@@ -110,10 +125,10 @@ def start():
     except KeyboardInterrupt:
         print(f"\n[server] Done. Total connections served: {stats['connections']}")
         s.close()
-        if tcpdump_proc:
-            tcpdump_proc.terminate()
-            tcpdump_proc.wait()
-            print(f"[server] Capture saved -> {PCAP_PATH}")
+        for ifc, path, p in tcpdump_procs:
+            p.terminate()
+            p.wait()
+            print(f"[server] Capture saved: {ifc} -> {path}")
 
 if __name__ == '__main__':
     start()

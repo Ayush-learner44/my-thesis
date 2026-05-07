@@ -25,6 +25,8 @@ IP_TO_HOST = {
     '2001:1:1::10': 'h0 (server)',
 }
 
+SERVER_IP = '2001:1:1::10'
+
 ALL_CLIENT_IPS = {
     '2001:1:1::1', '2001:1:1::2', '2001:1:1::3',
     '2001:1:1::4', '2001:1:1::5',
@@ -37,7 +39,7 @@ SCENARIOS = {
         'attacker_ips':  {'2001:1:1::1', '2001:1:1::2'},
         'legit_ips':     {'2001:1:1::3', '2001:1:1::4', '2001:1:1::5'},
         'total_attack':  4000,  # 2000 SYNs × 2 attacker hosts
-        'total_legit':   180,   # 60 conns × 3 legit hosts
+        'total_legit':   240,   # 80 conns × 3 legit hosts
     },
     '2': {
         'name':          'attacks.py  —  h1–h5 all attack',
@@ -58,7 +60,7 @@ SCENARIOS = {
         'attacker_ips':  set(),
         'legit_ips':     ALL_CLIENT_IPS.copy(),
         'total_attack':  0,
-        'total_legit':   300,   # 60 conns × 5 hosts
+        'total_legit':   400,   # 80 conns × 5 hosts
     },
     '5': {
         'name':          'Single attack.py from h1 only',
@@ -105,6 +107,69 @@ def pick_scenario():
         sys.exit(1)
 
     return attacker_ips, legit_ips, total_attack, total_legit
+
+
+def count_flags(pkts):
+    """Count SYNs, SYN-ACKs, and completed handshakes (3rd-ACK) in a pcap.
+
+    ACKs are counted by unique (src_ip, src_port) pairs — one entry per
+    TCP connection regardless of how many ACK packets it sends.
+    Server-originated ACKs (sport=80) are excluded; we only count
+    client-to-server handshake completions.
+    """
+    TCP_SYN = 0x002
+    TCP_ACK = 0x010
+    syns = 0; synacks = 0
+    per_ip_syn = {}
+    ack_connections = set()   # (src_ip, src_port) — one per unique connection
+
+    for pkt in pkts:
+        if IPv6 not in pkt or TCP not in pkt:
+            continue
+        flags = int(pkt[TCP].flags)
+        src   = pkt[IPv6].src
+        is_syn = bool(flags & TCP_SYN)
+        is_ack = bool(flags & TCP_ACK)
+        if is_syn and not is_ack:
+            syns += 1
+            per_ip_syn[src] = per_ip_syn.get(src, 0) + 1
+        elif is_syn and is_ack:
+            synacks += 1
+        elif is_ack and not is_syn:
+            if src != SERVER_IP:          # skip server's outgoing ACKs
+                ack_connections.add((src, pkt[TCP].sport))
+
+    acks = len(ack_connections)
+    per_ip_ack = {}
+    for (src, _) in ack_connections:
+        per_ip_ack[src] = per_ip_ack.get(src, 0) + 1
+
+    return syns, synacks, acks, per_ip_syn, per_ip_ack
+
+
+def print_path_comparison(path_a_pkts, path_b_pkts):
+    print("\n" + "=" * 60)
+    print("PER-PATH TRAFFIC BREAKDOWN")
+    print("=" * 60)
+    for label, pkts in [("PATH_A  (eth0 — detector switch / SYN path)", path_a_pkts),
+                         ("PATH_B  (eth1 — passthrough / ACK path)",     path_b_pkts)]:
+        syns, synacks, acks, per_ip_syn, per_ip_ack = count_flags(pkts)
+        print(f"\n  {label}")
+        print(f"    Pure SYNs        : {syns:6d}")
+        print(f"    SYN-ACKs         : {synacks:6d}")
+        print(f"    Completed handshakes (3rd ACK, client-only): {acks:6d}")
+        if per_ip_syn:
+            print(f"    SYNs by IP  :", end='')
+            for ip, n in sorted(per_ip_syn.items()):
+                host = IP_TO_HOST.get(ip, ip)
+                print(f"  {host}={n}", end='')
+            print()
+        if per_ip_ack:
+            print(f"    ACKs by IP  :", end='')
+            for ip, n in sorted(per_ip_ack.items()):
+                host = IP_TO_HOST.get(ip, ip)
+                print(f"  {host}={n}", end='')
+            print()
 
 
 def count_syns(pkts, attacker_ips, legit_ips):
@@ -198,23 +263,34 @@ def print_results(attack_reached, legit_reached, attack_per_ip, legit_per_ip,
 
 
 def main():
-    pcap_file = sys.argv[1] if len(sys.argv) > 1 else '/home/ayush/my/capture.pcap'
+    pcap_a = sys.argv[1] if len(sys.argv) > 1 else '/home/ayush/my/capture_path_a.pcap'
+    pcap_b = sys.argv[2] if len(sys.argv) > 2 else '/home/ayush/my/capture_path_b.pcap'
 
-    if not os.path.exists(pcap_file):
-        print(f"\nERROR: pcap not found: {pcap_file}")
-        print("\nStart tcpdump on h0 BEFORE the experiment:")
-        print("  (h0 xterm)  tcpdump -i h0-eth0 -w /home/ayush/my/capture.pcap &")
-        print("  After experiment: kill %1")
+    if not os.path.exists(pcap_a):
+        print(f"\nERROR: pcap not found: {pcap_a}")
+        print("Run server.py on h0 before the experiment — it starts tcpdump automatically.")
         sys.exit(1)
 
     attacker_ips, legit_ips, total_attack, total_legit = pick_scenario()
 
-    print(f"\nReading {pcap_file} ...")
-    pkts = rdpcap(pcap_file)
-    print(f"  {len(pkts)} total packets loaded")
+    print(f"\nReading {pcap_a} ...")
+    pkts_a = rdpcap(pcap_a)
+    print(f"  {len(pkts_a)} packets on path_a (eth0)")
 
+    pkts_b = []
+    if os.path.exists(pcap_b):
+        print(f"Reading {pcap_b} ...")
+        pkts_b = rdpcap(pcap_b)
+        print(f"  {len(pkts_b)} packets on path_b (eth1)")
+    else:
+        print(f"  (path_b pcap not found — skipping path comparison)")
+
+    # Per-path breakdown — the asymmetric routing proof
+    print_path_comparison(pkts_a, pkts_b)
+
+    # Metrics use path_a (SYNs that slipped through to h0 on the detector path)
     attack_reached, legit_reached, attack_per_ip, legit_per_ip = \
-        count_syns(pkts, attacker_ips, legit_ips)
+        count_syns(pkts_a, attacker_ips, legit_ips)
 
     print_results(attack_reached, legit_reached, attack_per_ip, legit_per_ip,
                   attacker_ips, legit_ips, total_attack, total_legit)

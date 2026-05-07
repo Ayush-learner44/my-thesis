@@ -76,6 +76,16 @@ struct threshold_digest_t {
     bit<48>  timestamp;
 }
 
+// Sent from the ACK branch when c0==0 OR c1==0 (can't decrement)
+// Signals that an ACK arrived for a flow whose SYN took a different path —
+// evidence of asymmetric routing. No timestamp needed; controller only counts.
+struct evidence_digest_t {
+    bit<128> src_ip;
+    bit<128> dst_ip;
+    bit<16>  dst_port;
+    bit<8>   protocol;
+}
+
 // ================================================================
 // PARSER
 // ================================================================
@@ -232,6 +242,18 @@ control MyIngress(inout headers_t hdr,
 
                 cms_row0.read(c0, idx0);
                 cms_row1.read(c1, idx1);
+
+                // EVIDENCE: at least one CMS row is zero — this switch never saw
+                // the SYN for this flow, so it arrived via the other path.
+                // OR condition: one collision-free row is enough to confirm asymmetry.
+                if (c0 == 0 || c1 == 0) {
+                    digest<evidence_digest_t>(1, {
+                        hdr.ipv6.srcAddr,
+                        hdr.ipv6.dstAddr,
+                        hdr.tcp.dstPort,
+                        hdr.ipv6.nextHdr
+                    });
+                }
 
                 if (c0 > 0) { cms_row0.write(idx0, c0 - 1); }
                 if (c1 > 0) { cms_row1.write(idx1, c1 - 1); }

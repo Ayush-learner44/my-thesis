@@ -1,11 +1,17 @@
 """
-DDoS Detection Controller — Pure gRPC / P4Runtime
-Implements the control plane algorithm from myarchitecture.txt:
-  1. Connect to s1 via P4Runtime/gRPC
-  2. Install L2 forwarding rules (MAC -> port)
-  3. Enable first_seen_digest_t and threshold_digest_t on s1
-  4. On FIRST_SEEN digest: record flow start timestamp (switch clock, microseconds)
-  5. On THRESHOLD digest: compute pps, run ML ensemble, block src_ip if ATTACK
+DDoS Detection Controller — Asymmetric 3-switch topology
+
+Switch roles (set by the experimenter via network.py routing, NOT hardcoded here):
+  merge_sw   (traffic_splitter.p4) — splits traffic; controller installs L2 only
+  path_a_sw  (ddos_detector.p4)   — full detector: CMS, digests, block rules
+  path_b_sw  (ddos_detector.p4)   — full detector: CMS, digests, block rules
+                                     (identical capabilities to path_a_sw)
+
+SPLITTER_SWITCHES defines which switches run the splitter P4.
+All other switches are treated as detector switches — identical treatment:
+  - All three digest types enabled
+  - Block rules pushed to all of them on detection
+  - Digest receiver thread per switch
 """
 
 import os, sys, time, pickle, threading, logging, ipaddress
@@ -18,14 +24,24 @@ from p4utils.utils.helper import load_topo
 logging.basicConfig(level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger('DDoS')
+log.setLevel(logging.INFO)
 log.propagate = False
+_handler = logging.StreamHandler()
+_handler.setLevel(logging.INFO)
+_handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+log.addHandler(_handler)
 
 _PROJECT_ROOT = os.path.join(os.path.dirname(__file__), '..')
-MODELS_DIR = os.path.join(_PROJECT_ROOT, 'ml', 'models')
-P4RT_PATH  = os.path.join(_PROJECT_ROOT, 'p4src', 'ddos_detector_p4rt.txt')
-JSON_PATH  = os.path.join(_PROJECT_ROOT, 'p4src', 'ddos_detector.json')
+MODELS_DIR    = os.path.join(_PROJECT_ROOT, 'ml', 'models')
 
-# MACs must match network.py setIntfMac values
+SPLITTER_P4RT = os.path.join(_PROJECT_ROOT, 'p4src', 'traffic_splitter_p4rt.txt')
+SPLITTER_JSON = os.path.join(_PROJECT_ROOT, 'p4src', 'traffic_splitter.json')
+DETECTOR_P4RT = os.path.join(_PROJECT_ROOT, 'p4src', 'ddos_detector_p4rt.txt')
+DETECTOR_JSON = os.path.join(_PROJECT_ROOT, 'p4src', 'ddos_detector.json')
+
+# Switches running the splitter P4 — no digests, no block rules pushed here
+SPLITTER_SWITCHES = {'merge_sw'}
+
 HOST_MACS = {
     'h0': 'aa:00:00:00:00:00',
     'h1': 'aa:00:00:00:00:01',
@@ -35,14 +51,28 @@ HOST_MACS = {
     'h5': 'aa:00:00:00:00:05',
 }
 
-# Port numbers match port1= values in network.py addLink calls on s1
-PORT_MAP = {
-    'h1': 1,
-    'h2': 2,
-    'h3': 3,
-    'h4': 4,
-    'h5': 5,
-    'h0': 6,
+# ================================================================
+# PORT MAPS — must match port1= values in network.py addLink calls
+# ================================================================
+
+MERGE_PORT_MAP = {
+    'h1': 1, 'h2': 2, 'h3': 3, 'h4': 4, 'h5': 5,
+}
+
+PATH_A_PORT_MAP = {
+    'h0': 2,
+    'h1': 1, 'h2': 1, 'h3': 1, 'h4': 1, 'h5': 1,
+}
+
+PATH_B_PORT_MAP = {
+    'h0': 2,
+    'h1': 1, 'h2': 1, 'h3': 1, 'h4': 1, 'h5': 1,
+}
+
+PORT_MAPS = {
+    'merge_sw':  MERGE_PORT_MAP,
+    'path_a_sw': PATH_A_PORT_MAP,
+    'path_b_sw': PATH_B_PORT_MAP,
 }
 
 MAX_FLOW_TABLE_SIZE = 100_000
@@ -78,7 +108,6 @@ class EnsembleClassifier:
         log.info(f"Ensemble ready: {len(self.models)} models loaded")
 
     def predict(self, pps):
-        # Scale PPS to match CICDDoS2019 training distribution (millions of pps)
         pps_scaled = pps * 5000.0
         features = np.array([[pps_scaled]])
         if self.scaler:
@@ -89,36 +118,41 @@ class EnsembleClassifier:
 
 
 # ================================================================
-# FLOW START TABLE
+# FLOW TABLE
+# One entry per flow. Columns: start_time, ack_count.
+# ack_count accumulates forever — mirrors what symmetric CMS did in hardware.
 # ================================================================
 
-class FlowStartTable:
-    """
-    Maps 4-tuple flow keys to their first-SYN switch timestamp (microseconds).
-    Key:   (src_ip_str, dst_ip_str, dst_port, protocol)
-    Value: ingress_global_timestamp of the first SYN (48-bit, microseconds)
-    """
-
+class FlowTable:
     def __init__(self, max_size=MAX_FLOW_TABLE_SIZE):
-        self._table = {}
+        self._table = {}   # flow_key -> [start_us, ack_count]
         self._lock  = threading.Lock()
         self._max   = max_size
 
     def record(self, flow_key, timestamp_us):
-        """Store start timestamp for a new flow. No-op if flow already tracked.
-        Returns True if this is a genuinely new entry."""
+        """Insert new flow. Returns True if new, False if already exists."""
         with self._lock:
             if flow_key in self._table:
                 return False
             if len(self._table) >= self._max:
-                # Evict the oldest entry (insertion-order dict, Python 3.7+)
                 del self._table[next(iter(self._table))]
-            self._table[flow_key] = timestamp_us
+            self._table[flow_key] = [timestamp_us, 0]
             return True
 
     def get_start(self, flow_key):
         with self._lock:
-            return self._table.get(flow_key)
+            e = self._table.get(flow_key)
+            return e[0] if e else None
+
+    def increment_ack(self, flow_key):
+        with self._lock:
+            if flow_key in self._table:
+                self._table[flow_key][1] += 1
+
+    def get_ack(self, flow_key):
+        with self._lock:
+            e = self._table.get(flow_key)
+            return e[1] if e else 0
 
 
 # ================================================================
@@ -128,11 +162,11 @@ class FlowStartTable:
 class DDoSController:
     def __init__(self):
         self.ensemble    = EnsembleClassifier(MODELS_DIR)
-        self.flow_table  = FlowStartTable()
+        self.flow_table  = FlowTable()
         self.switches    = {}
-        self.blocked_ips = set()   # set of IPv6 strings already blocked
+        self.blocked_ips = set()
         self.stats       = {'first_seen': 0, 'threshold': 0,
-                            'attacks': 0,    'benign': 0}
+                            'evidence':   0, 'attacks':   0, 'benign': 0}
         self._lock       = threading.Lock()
 
         self.topo = load_topo('topology.json')
@@ -146,83 +180,83 @@ class DDoSController:
 
     def _connect_switches(self):
         log.info("Connecting to switches via P4Runtime/gRPC...")
+        p4_files = {sw: (SPLITTER_P4RT, SPLITTER_JSON)
+                    if sw in SPLITTER_SWITCHES
+                    else (DETECTOR_P4RT, DETECTOR_JSON)
+                    for sw in self.topo.get_p4switches()}
+
         for sw in self.topo.get_p4switches():
             device_id = self.topo.get_p4switch_id(sw)
             grpc_port = self.topo.get_grpc_port(sw)
+            p4rt, jsn = p4_files[sw]
             try:
                 self.switches[sw] = SimpleSwitchP4RuntimeAPI(
                     device_id = device_id,
                     grpc_port = grpc_port,
-                    p4rt_path = P4RT_PATH,
-                    json_path = JSON_PATH,
+                    p4rt_path = p4rt,
+                    json_path  = jsn,
                 )
-                log.info(f"  Connected: {sw} (device_id={device_id} grpc={grpc_port})")
+                role = 'splitter' if sw in SPLITTER_SWITCHES else 'detector'
+                log.info(f"  Connected: {sw} [{role}] (device_id={device_id} grpc={grpc_port})")
             except Exception as e:
                 log.error(f"  Failed to connect {sw}: {e}")
 
     def _install_forwarding_rules(self):
-        log.info("Installing L2 forwarding rules on s1...")
-        api = self.switches.get('s1')
-        if not api:
-            log.error("s1 not connected — skipping forwarding rules")
-            return
-        for host, port in PORT_MAP.items():
-            mac = HOST_MACS.get(host)
-            if not mac:
+        for sw, port_map in PORT_MAPS.items():
+            api = self.switches.get(sw)
+            if not api:
+                log.warning(f"  {sw} not connected — skipping L2 rules")
                 continue
-            try:
-                api.table_add('MyIngress.l2_forward', 'MyIngress.forward',
-                              [mac], [str(port)])
-                log.info(f"  s1: {host} ({mac}) -> port {port}")
-            except Exception as e:
-                if 'already exists' not in str(e).lower():
-                    log.warning(f"  Rule failed s1->{host}: {e}")
+            log.info(f"Installing L2 rules on {sw}...")
+            for host, port in port_map.items():
+                mac = HOST_MACS.get(host)
+                if not mac:
+                    continue
+                try:
+                    api.table_add('MyIngress.l2_forward', 'MyIngress.forward',
+                                  [mac], [str(port)])
+                    log.info(f"  {sw}: {host} ({mac}) -> port {port}")
+                except Exception as e:
+                    if 'already exists' not in str(e).lower():
+                        log.warning(f"  {sw} L2 rule failed ({host}): {e}")
 
     def _enable_digests(self):
-        """Enable both digest types on s1.
-        max_timeout_ns=0, max_list_size=1, ack_timeout_ns=0 → per-packet, no batching.
-        The wrapper ACKs automatically after each get_digest_list() call."""
-        log.info("Enabling digests on s1...")
-        api = self.switches.get('s1')
-        if not api:
-            log.error("s1 not connected — cannot enable digests")
-            return
-        for name in ('first_seen_digest_t', 'threshold_digest_t'):
-            try:
-                api.digest_enable(name, max_timeout_ns=0,
-                                  max_list_size=1, ack_timeout_ns=0)
-                log.info(f"  Enabled: {name}")
-            except Exception as e:
-                log.warning(f"  digest_enable({name}): {e}")
+        """Enable all three digest types on every detector switch.
+        Splitter switches (merge_sw) do not run detector P4 — skipped."""
+        for sw, api in self.switches.items():
+            if sw in SPLITTER_SWITCHES:
+                continue
+            log.info(f"Enabling digests on {sw}...")
+            for name in ('first_seen_digest_t', 'threshold_digest_t', 'evidence_digest_t'):
+                try:
+                    api.digest_enable(name, max_timeout_ns=0,
+                                      max_list_size=1, ack_timeout_ns=0)
+                    log.info(f"  {sw}: enabled {name}")
+                except Exception as e:
+                    log.warning(f"  {sw} digest_enable({name}): {e}")
 
     # ------------------------------------------------------------------
-    # BLOCKING
+    # BLOCKING — pushed to ALL detector switches so whichever path the
+    # attacker uses next, they are blocked immediately on arrival
     # ------------------------------------------------------------------
 
     def _push_block_rule(self, src_ip_str):
-        """Install drop rule for src_ip in dangerous_table on ALL switches."""
-        for sw_name, api in self.switches.items():
+        for sw, api in self.switches.items():
+            if sw in SPLITTER_SWITCHES:
+                continue
             try:
                 api.table_add('MyIngress.dangerous_table', 'MyIngress.drop',
                               [src_ip_str])
-                log.info(f"  Block rule installed on {sw_name}: {src_ip_str}")
+                log.info(f"  Block rule installed on {sw}: {src_ip_str}")
             except Exception as e:
                 if 'already exists' not in str(e).lower():
-                    log.warning(f"  Block rule failed {sw_name}: {e}")
+                    log.warning(f"  Block rule failed on {sw}: {e}")
 
     # ------------------------------------------------------------------
     # DIGEST HANDLERS
     # ------------------------------------------------------------------
 
-    def _handle_first_seen(self, members):
-        """
-        first_seen_digest_t field order (matches P4 struct definition):
-          [0] src_ip    bit<128>
-          [1] dst_ip    bit<128>
-          [2] dst_port  bit<16>
-          [3] protocol  bit<8>
-          [4] timestamp bit<48>  (ingress_global_timestamp, microseconds)
-        """
+    def _handle_first_seen(self, members, sw_name):
         src_ip    = _bytes_to_ipv6(members[0].bitstring)
         dst_ip    = _bytes_to_ipv6(members[1].bitstring)
         dst_port  = int.from_bytes(members[2].bitstring, 'big')
@@ -236,19 +270,10 @@ class DDoSController:
             self.stats['first_seen'] += 1
 
         if is_new:
-            log.info(f"FIRST_SEEN  {src_ip} -> {dst_ip}:{dst_port} "
+            log.info(f"FIRST_SEEN  [{sw_name}]  {src_ip} -> {dst_ip}:{dst_port} "
                      f"proto={protocol}  ts={timestamp}us")
 
-    def _handle_threshold(self, members):
-        """
-        threshold_digest_t field order (matches P4 struct definition):
-          [0] src_ip    bit<128>
-          [1] dst_ip    bit<128>
-          [2] dst_port  bit<16>
-          [3] protocol  bit<8>
-          [4] cms_min   bit<32>
-          [5] timestamp bit<48>  (ingress_global_timestamp, microseconds)
-        """
+    def _handle_threshold(self, members, sw_name):
         src_ip    = _bytes_to_ipv6(members[0].bitstring)
         dst_ip    = _bytes_to_ipv6(members[1].bitstring)
         dst_port  = int.from_bytes(members[2].bitstring, 'big')
@@ -263,66 +288,78 @@ class DDoSController:
             already_blocked = src_ip in self.blocked_ips
 
         if already_blocked:
-            return   # drop rule already installed, skip ML
+            return
 
-        # Elapsed time using switch clock (microseconds, same epoch for both digests)
         start_time = self.flow_table.get_start(flow_key)
         if start_time is None:
-            # Fallback: FIRST_SEEN was missed — assume 1 second elapsed
             start_time = timestamp - 1_000_000
 
-        elapsed = (timestamp - start_time) / 1_000_000.0   # µs → seconds
-        if elapsed <= 0:
-            elapsed = 1.0
-
-        total_fwd_pkts = cms_min
-        pps = total_fwd_pkts / elapsed
+        ack_count     = self.flow_table.get_ack(flow_key)
+        adjusted      = max(0, cms_min - ack_count)
+        elapsed       = max(0.001, (timestamp - start_time) / 1_000_000.0)
+        pps           = adjusted / elapsed
 
         is_attack, votes, total = self.ensemble.predict(pps)
 
-        log.info(f"THRESHOLD   {src_ip} -> :{dst_port}  cms_min={cms_min}  "
-                 f"elapsed={elapsed:.3f}s  vote={votes}/{total}")
+        log.info(f"THRESHOLD   [{sw_name}]  {src_ip} -> :{dst_port}  "
+                 f"cms_min={cms_min}  ack_count={ack_count}  adjusted={adjusted}  "
+                 f"elapsed={elapsed:.3f}s  pps={pps:.1f}  pps_scaled={pps*5000:.0f}  vote={votes}/{total}")
 
         if is_attack:
-            log.warning("=" * 60)
-            log.warning(f"ATTACK DETECTED: {src_ip}")
-            log.warning(f"  cms_min={cms_min}  vote={votes}/{total}")
-            log.warning(f"  -> installing drop rule on all switches")
-            log.warning("=" * 60)
+            log.warning(
+                f"\n{'─'*48}\n"
+                f"  ATTACK DETECTED\n"
+                f"  src        : {src_ip}  (via {sw_name})\n"
+                f"  cms_min    : {cms_min}   ack_count  : {ack_count}   adjusted : {adjusted}\n"
+                f"  pps        : {pps:.1f}   pps_scaled : {pps*5000:.0f}   vote : {votes}/{total}\n"
+                f"  action     : drop rule installed on ALL detector switches\n"
+                f"{'─'*48}"
+            )
             with self._lock:
                 self.blocked_ips.add(src_ip)
                 self.stats['attacks'] += 1
             self._push_block_rule(src_ip)
         else:
-            log.info("=" * 60)
-            log.info(f"BENIGN: {src_ip}")
-            log.info(f"  cms_min={cms_min}  vote={votes}/{total}")
-            log.info(f"  -> allowed, no action taken")
-            log.info("=" * 60)
+            log.info(
+                f"\n{'─'*48}\n"
+                f"  BENIGN\n"
+                f"  src        : {src_ip}  (via {sw_name})\n"
+                f"  cms_min    : {cms_min}   ack_count  : {ack_count}   adjusted : {adjusted}\n"
+                f"  pps        : {pps:.1f}   pps_scaled : {pps*5000:.0f}   vote : {votes}/{total}\n"
+                f"{'─'*48}"
+            )
             with self._lock:
                 self.stats['benign'] += 1
 
+    def _handle_evidence(self, members, sw_name):
+        src_ip   = _bytes_to_ipv6(members[0].bitstring)
+        dst_ip   = _bytes_to_ipv6(members[1].bitstring)
+        dst_port = int.from_bytes(members[2].bitstring, 'big')
+        protocol = int.from_bytes(members[3].bitstring, 'big')
+
+        flow_key = (src_ip, dst_ip, dst_port, protocol)
+        self.flow_table.increment_ack(flow_key)
+
+        with self._lock:
+            self.stats['evidence'] += 1
+
+        log.debug(f"EVIDENCE    [{sw_name}]  {src_ip} -> :{dst_port}")
+
     # ------------------------------------------------------------------
-    # DIGEST RECEIVER THREAD
+    # DIGEST RECEIVER — one thread per detector switch
+    # Digest type identified by member count:
+    #   4 members → evidence_digest_t
+    #   5 members → first_seen_digest_t
+    #   6 members → threshold_digest_t
     # ------------------------------------------------------------------
 
     def _recv_digest(self, sw_name):
-        """Block on the P4Runtime gRPC stream from sw_name.
-
-        Both digest types arrive on the same stream. They are differentiated
-        by struct member count:
-          6 members → first_seen_digest_t
-          7 members → threshold_digest_t
-
-        The wrapper sends the ACK automatically after each get_digest_list().
-        timeout=1 is a recovery heartbeat only, not a polling interval.
-        """
         api = self.switches.get(sw_name)
         if not api:
             log.error(f"Digest receiver: no API for {sw_name}")
             return
 
-        log.info(f"Digest receiver ready on {sw_name} (blocking on gRPC stream)")
+        log.info(f"Digest receiver ready on {sw_name}")
         while True:
             try:
                 digest_list = api.get_digest_list(timeout=1)
@@ -333,10 +370,12 @@ class DDoSController:
                     members = digest_entry.struct.members
                     n = len(members)
 
-                    if n == 5:
-                        self._handle_first_seen(members)
+                    if n == 4:
+                        self._handle_evidence(members, sw_name)
+                    elif n == 5:
+                        self._handle_first_seen(members, sw_name)
                     elif n == 6:
-                        self._handle_threshold(members)
+                        self._handle_threshold(members, sw_name)
                     else:
                         log.warning(f"Unexpected digest on {sw_name}: {n} members")
 
@@ -349,16 +388,21 @@ class DDoSController:
     # ------------------------------------------------------------------
 
     def start(self):
-        t = threading.Thread(target=self._recv_digest, args=('s1',), daemon=True)
-        t.start()
+        # Start one receiver thread per detector switch (identical treatment)
+        detector_switches = [sw for sw in self.switches if sw not in SPLITTER_SWITCHES]
+        for sw in detector_switches:
+            t = threading.Thread(target=self._recv_digest, args=(sw,), daemon=True)
+            t.start()
 
         log.info("")
         log.info("=" * 60)
         log.info("DDoS Detection Controller RUNNING")
-        log.info("  Digest 1: FIRST_SEEN  -> records flow start timestamp")
-        log.info("  Digest 2: THRESHOLD   -> fires every 64 SYNs -> ML")
-        log.info("  Block key: src IPv6 address in dangerous_table")
-        log.info("  Features: [pps * 5000]")
+        log.info(f"  Splitter switches  : {sorted(SPLITTER_SWITCHES)}")
+        log.info(f"  Detector switches  : {sorted(detector_switches)}")
+        log.info("  All detector switches: identical capabilities")
+        log.info("  Digests : first_seen | threshold | evidence (all 3 on each)")
+        log.info("  Blocking: dangerous_table pushed to ALL detector switches")
+        log.info("  pps formula: max(0, cms_min - ack_count) / elapsed_total")
         log.info("=" * 60)
 
         try:
@@ -368,7 +412,7 @@ class DDoSController:
                     s = self.stats.copy()
                     n_blocked = len(self.blocked_ips)
                 log.info(f"STATS | FirstSeen:{s['first_seen']}  "
-                         f"Threshold:{s['threshold']}  "
+                         f"Threshold:{s['threshold']}  Evidence:{s['evidence']}  "
                          f"Attacks:{s['attacks']}  Benign:{s['benign']}  "
                          f"Blocked:{n_blocked}")
         except KeyboardInterrupt:
@@ -379,6 +423,7 @@ class DDoSController:
             print("FINAL STATS")
             print(f"  FIRST_SEEN digests  : {s['first_seen']}")
             print(f"  THRESHOLD digests   : {s['threshold']}")
+            print(f"  EVIDENCE digests    : {s['evidence']}")
             print(f"  Attacks detected    : {s['attacks']}")
             print(f"  Benign flows        : {s['benign']}")
             print(f"  IPs blocked         : {n_blocked}")

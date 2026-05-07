@@ -3,20 +3,20 @@ flood.py — Realistic flash crowd simulation with mixed traffic pattern.
 Self-assigns IPv6 if p4-utils didn't.
 
 Traffic pattern (200 total connections):
-  Phase 1 —  70 simultaneous burst   (viral link / event spike)
-  Phase 2 —  70 sequential @ 10/sec  (sustained high-interest traffic)
-  Phase 3 —  30 simultaneous burst   (second spike / retweet wave)
-  Phase 4 —  30 sequential @ random  (traffic settling back down)
+  Phase 1 —  70 fast sequential @ 100/sec  (viral link / event spike)
+  Phase 2 —  70 sequential @ 10/sec        (sustained high-interest traffic)
+  Phase 3 —  30 fast sequential @ 100/sec  (second spike / retweet wave)
+  Phase 4 —  30 sequential @ random        (traffic settling back down)
 
-All phases use real TCP connections — ACKs always cancel SYNs in CMS,
-so the counter never cleanly accumulates to 64 regardless of rate.
-Sequential phases are inherently safe: counter bounces 0→1→0 per connection.
+All phases use real TCP connections — full 3-way handshake completes.
+At 100/sec each connection's ACK reaches path_b_sw before the next 64
+SYNs accumulate, so the CMS-based detector sees acks and scores low pps.
 
 Run from any legit host xterm:
     python3 /home/ayush/my/flood.py
 """
 
-import socket, re, subprocess, threading, time, random
+import socket, re, subprocess, time, random
 
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.all.disable_ipv6=0'], capture_output=True)
 subprocess.run(['sysctl', '-w', 'net.ipv6.conf.default.disable_ipv6=0'], capture_output=True)
@@ -73,31 +73,32 @@ def single_connection():
     except Exception:
         pass
 
-def burst(n, label):
-    print(f"[flood] {label}: firing {n} simultaneous connections...")
-    threads = [threading.Thread(target=single_connection) for _ in range(n)]
-    for t in threads: t.start()
-    for t in threads: t.join()
-    print(f"[flood] {label}: done")
-
 print(f"[flood] Host  : {my_ipv6}")
 print(f"[flood] Target: {VICTIM_IP}:{DST_PORT}")
-print(f"[flood] Pattern: 70 burst → 70 @ 10/sec → 30 burst → 30 @ random")
+print(f"[flood] Pattern: 70 @ 100/sec → 70 @ 10/sec → 30 @ 100/sec → 30 @ random")
 
-# Phase 1: 70 simultaneous burst
-burst(70, "Phase-1 burst")
+# Phase 1: 70 fast sequential at 100/sec — spike arrival, staggered not simultaneous
+print(f"[flood] Phase-1: 70 connections at 100/sec...")
+for i in range(70):
+    single_connection()
+    time.sleep(0.01)
+print(f"[flood] Phase-1: done")
 
-# Phase 2: 70 sequential at 10/sec (faster than traffic.py but safe — ACKs cancel SYNs)
+# Phase 2: 70 sequential at 10/sec
 print(f"[flood] Phase-2: 70 connections at 10/sec...")
 for i in range(70):
     single_connection()
     time.sleep(0.1)
 print(f"[flood] Phase-2: done")
 
-# Phase 3: 30 simultaneous burst
-burst(30, "Phase-3 burst")
+# Phase 3: 30 fast sequential at 100/sec — second spike
+print(f"[flood] Phase-3: 30 connections at 100/sec...")
+for i in range(30):
+    single_connection()
+    time.sleep(0.01)
+print(f"[flood] Phase-3: done")
 
-# Phase 4: 30 at random speed between 5–15/sec (0.067–0.2s interval)
+# Phase 4: 30 at random speed between 5–15/sec
 print(f"[flood] Phase-4: 30 connections at random speed (5–15/sec)...")
 for i in range(30):
     single_connection()
