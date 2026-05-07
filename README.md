@@ -30,32 +30,32 @@ Improves on the P4M3 paper baseline (86% recall, 89% F1) achieving **96.70% reca
 │                         CONTROL PLANE                            │
 │                                                                  │
 │   controller.py                                                  │
-│   ┌──────────────────────────────────────────────────────────┐  │
-│   │  FlowTable              EnsembleClassifier               │  │
-│   │  [start_time,           (KNN+RF+DT+XGB+SVM → majority)  │  │
-│   │   ack_count]                      │                      │  │
-│   │       │                           │                      │  │
-│   │  FIRST_SEEN    THRESHOLD    EVIDENCE                     │  │
-│   │  handler       handler      handler                      │  │
-│   │       └──────────┬────────────────┘                     │  │
-│   │             gRPC / P4Runtime (3 switches)                │  │
-│   └─────────────────┼────────────────────────────────────────┘  │
+│   ┌──────────────────────────────────────────────────────────┐   │
+│   │  FlowTable              EnsembleClassifier               │   │
+│   │  [start_time,           (KNN+RF+DT+XGB+SVM → majority)   │   │
+│   │   ack_count]                      │                      │   │
+│   │       │                           │                      │   │
+│   │  FIRST_SEEN    THRESHOLD    EVIDENCE                     │   │
+│   │  handler       handler      handler                      │   │
+│   │       └──────────┬────────────────┘                      │   │
+│   │             gRPC / P4Runtime (3 switches)                │   │
+│   └─────────────────┼────────────────────────────────────────┘   │
 └─────────────────────┼────────────────────────────────────────────┘
                       │ table_add (block rule → path_a_sw + path_b_sw)
 ┌─────────────────────┼────────────────────────────────────────────┐
-│                  DATA PLANE (BMv2)                                │
+│                  DATA PLANE (BMv2)                               │
 │                                                                  │
-│  h1,h2,h3,h4,h5                                                 │
+│  h1,h2,h3,h4,h5                                                  │
 │       │                                                          │
 │       ▼                                                          │
-│  ┌─────────────┐   SYNs → port 6   ┌──────────────┐            │
-│  │  merge_sw   │ ─────────────────► │  path_a_sw   │ ──► h0-eth0│
-│  │(splitter.p4)│                    │(detector.p4) │            │
-│  │             │   ACKs → port 7   └──────────────┘            │
-│  │             │ ─────────────────► ┌──────────────┐            │
-│  └─────────────┘                    │  path_b_sw   │ ──► h0-eth1│
-│                                     │(detector.p4) │            │
-│                                     └──────────────┘            │
+│  ┌─────────────┐   SYNs → port 6   ┌──────────────┐              │
+│  │  merge_sw   │ ─────────────────► │  path_a_sw   │ ──► h0-eth0 │
+│  │(splitter.p4)│                    │(detector.p4) │             │
+│  │             │   ACKs → port 7   └──────────────┘              │
+│  │             │ ─────────────────► ┌──────────────┐             │
+│  └─────────────┘                    │  path_b_sw   │ ──► h0-eth1 │
+│                                     │(detector.p4) │             │
+│                                     └──────────────┘             │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -71,10 +71,10 @@ Improves on the P4M3 paper baseline (86% recall, 89% F1) achieving **96.70% reca
 
 ```
 h1 (2001:1:1::1) ─── port 1 ──┐
-h2 (2001:1:1::2) ─── port 2 ──┤          ┌── path_a_sw ── h0-eth0
-h3 (2001:1:1::3) ─── port 3 ──┼─ merge_sw ┤  (ddos_detector.p4)
-h4 (2001:1:1::4) ─── port 4 ──┤  (splitter)└── path_b_sw ── h0-eth1
-h5 (2001:1:1::5) ─── port 5 ──┘          (ddos_detector.p4)
+h2 (2001:1:1::2) ─── port 2 ──┤           ┌── path_a_sw ── h0-eth0
+h3 (2001:1:1::3) ─── port 3 ──┼─ merge_sw ┤    (ddos_detector.p4)
+h4 (2001:1:1::4) ─── port 4 ──┤ (splitter)└── path_b_sw ── h0-eth1
+h5 (2001:1:1::5) ─── port 5 ──┘                (ddos_detector.p4)
 ```
 
 **Port assignments:**
